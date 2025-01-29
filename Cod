@@ -1,0 +1,206 @@
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+import java.util.List;
+
+@Component
+@ConfigurationProperties(prefix = "kdcproxy")
+public class KdcProxyConfig {
+
+    private List<KdcServer> servers;
+    private int timeout;
+    private int fragmentSize;
+
+    public static class KdcServer {
+        private String host;
+        private int port;
+        private String protocol;
+
+        // Геттеры и сеттеры
+        public String getHost() { return host; }
+        public void setHost(String host) { this.host = host; }
+
+        public int getPort() { return port; }
+        public void setPort(int port) { this.port = port; }
+
+        public String getProtocol() { return protocol; }
+        public void setProtocol(String protocol) { this.protocol = protocol; }
+    }
+
+    // Геттеры и сеттеры
+    public List<KdcServer> getServers() { return servers; }
+    public void setServers(List<KdcServer> servers) { this.servers = servers; }
+
+    public int getTimeout() { return timeout; }
+    public void setTimeout(int timeout) { this.timeout = timeout; }
+
+    public int getFragmentSize() { return fragmentSize; }
+    public void setFragmentSize(int fragmentSize) { this.fragmentSize = fragmentSize; }
+}
+
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+@Component
+@ConfigurationProperties(prefix = "kdcproxy.mit")
+public class MitKerberosConfig {
+    
+    private boolean enabled;
+    private String defaultRealm;
+
+    // Геттеры и сеттеры
+    public boolean isEnabled() { return enabled; }
+    public void setEnabled(boolean enabled) { this.enabled = enabled; }
+
+    public String getDefaultRealm() { return defaultRealm; }
+    public void setDefaultRealm(String defaultRealm) { this.defaultRealm = defaultRealm; }
+}
+
+import org.bouncycastle.asn1.*;
+
+import java.io.IOException;
+
+public class KerberosCodec {
+
+    public static ASN1Encodable decode(byte[] data) throws IOException {
+        try (ASN1InputStream inputStream = new ASN1InputStream(data)) {
+            return inputStream.readObject();
+        }
+    }
+
+    public static byte[] encode(ASN1Encodable asn1Object) throws IOException {
+        return asn1Object.toASN1Primitive().getEncoded();
+    }
+
+    public static byte[] createKerberosRequest(String realm, String principalName) throws IOException {
+        ASN1EncodableVector vector = new ASN1EncodableVector();
+        vector.add(new DERUTF8String(realm));
+        vector.add(new DERUTF8String(principalName));
+        return new DERSequence(vector).getEncoded();
+    }
+}
+
+import org.bouncycastle.asn1.*;
+
+import java.io.IOException;
+
+public class KerberosParser {
+
+    public static String parseAsn1Structure(byte[] data) throws IOException {
+        ASN1Encodable obj = KerberosCodec.decode(data);
+        return obj.toString();
+    }
+
+    public static boolean isValidKerberosMessage(byte[] data) {
+        try {
+            KerberosCodec.decode(data);
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+}
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import javax.servlet.http.HttpServletRequest;
+import java.io.*;
+import java.net.*;
+import java.util.*;
+
+@Service
+public class KdcProxyService {
+
+    private final KdcProxyConfig config;
+
+    public KdcProxyService(KdcProxyConfig config) {
+        this.config = config;
+    }
+
+    public ResponseEntity<byte[]> handleRequest(HttpServletRequest request, byte[] requestBody) {
+        try {
+            boolean isFragmented = checkFragmentation(request);
+            byte[] decodedBody = isFragmented ? decodeFragmentedRequest(requestBody) : requestBody;
+
+            byte[] responseFromKdc = sendToKdc(decodedBody);
+            byte[] encodedResponse = isFragmented ? encodeFragmentedResponse(responseFromKdc) : responseFromKdc;
+
+            return ResponseEntity.ok().body(encodedResponse);
+        } catch (IOException e) {
+            return ResponseEntity.status(500).build();
+        }
+    }
+
+    private boolean checkFragmentation(HttpServletRequest request) {
+        String contentType = request.getContentType();
+        return contentType != null && contentType.startsWith("application/kerberos");
+    }
+
+    private byte[] decodeFragmentedRequest(byte[] data) throws IOException {
+        return KerberosCodec.decode(data).toASN1Primitive().getEncoded();
+    }
+
+    private byte[] encodeFragmentedResponse(byte[] data) throws IOException {
+        return KerberosCodec.encode(KerberosCodec.decode(data));
+    }
+
+    private byte[] sendToKdc(byte[] requestBody) throws IOException {
+        for (KdcProxyConfig.KdcServer server : config.getServers()) {
+            try {
+                if ("UDP".equalsIgnoreCase(server.getProtocol())) {
+                    return sendUdpRequest(server, requestBody);
+                } else {
+                    return sendTcpRequest(server, requestBody);
+                }
+            } catch (IOException ignored) {
+            }
+        }
+        throw new IOException("Все KDC-серверы недоступны");
+    }
+
+    private byte[] sendTcpRequest(KdcProxyConfig.KdcServer server, byte[] requestBody) throws IOException {
+        try (Socket socket = new Socket(server.getHost(), server.getPort())) {
+            socket.getOutputStream().write(requestBody);
+            return socket.getInputStream().readAllBytes();
+        }
+    }
+
+    private byte[] sendUdpRequest(KdcProxyConfig.KdcServer server, byte[] requestBody) throws IOException {
+        DatagramSocket socket = new DatagramSocket();
+        InetAddress address = InetAddress.getByName(server.getHost());
+
+        DatagramPacket packet = new DatagramPacket(requestBody, requestBody.length, address, server.getPort());
+        socket.send(packet);
+
+        byte[] buffer = new byte[config.getFragmentSize()];
+        DatagramPacket responsePacket = new DatagramPacket(buffer, buffer.length);
+        socket.receive(responsePacket);
+
+        return Arrays.copyOf(buffer, responsePacket.getLength());
+    }
+}
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import javax.servlet.http.HttpServletRequest;
+
+@RestController
+@RequestMapping("/KdcProxy")
+public class KdcProxyController {
+
+    private final KdcProxyService kdcProxyService;
+
+    public KdcProxyController(KdcProxyService kdcProxyService) {
+        this.kdcProxyService = kdcProxyService;
+    }
+
+    @PostMapping
+    public ResponseEntity<byte[]> proxyRequest(
+            @RequestBody byte[] requestBody,
+            HttpServletRequest request) {
+        return kdcProxyService.handleRequest(request, requestBody);
+    }
+}
+
+
+
