@@ -5,5 +5,20 @@ server:
 
 kdcproxy:
   servers:
-    - host: "kdc.example.com"
-      port
+    - host: "kdc1.example.com"
+      port: 88
+      protocol: "UDP"
+    - host: "kdc2.example.com"
+      port: 88
+      protocol: "TCP"
+  timeout: 5000  # Таймаут запросов в миллисекундах
+  fragmentSize: 1400  # Максимальный размер пакета
+
+kdcproxy.mit:
+  enabled: true
+  defaultRealm: "EXAMPLE.COM"
+
+logging:
+  level:
+    root: INFO
+    com.example.kdcproxy: DEBUG
