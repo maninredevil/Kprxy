@@ -1,0 +1,37 @@
+import org.bouncycastle.asn1.*;
+
+public class ProxyMessage extends ASN1Object {
+    private ASN1OctetString message;
+    private ASN1GeneralString realm;
+    private ASN1Integer flags;
+
+    public ProxyMessage(byte[] messageData) {
+        this.message = new DEROctetString(messageData);
+    }
+
+    public void setRealm(String realm) {
+        this.realm = new DERGeneralString(realm);
+    }
+
+    public void setFlags(int flags) {
+        this.flags = new ASN1Integer(flags);
+    }
+
+    @Override
+    public ASN1Primitive toASN1Primitive() {
+        ASN1EncodableVector vector = new ASN1EncodableVector();
+        vector.add(new DERTaggedObject(true, 0, message));
+        if (realm != null) {
+            vector.add(new DERTaggedObject(true, 1, realm));
+        }
+        if (flags != null) {
+            vector.add(new DERTaggedObject(false, 2, flags));
+        }
+        return new DERSequence(vector);
+    }
+
+    public static byte[] encodeProxyMessage(byte[] data) throws Exception {
+        ProxyMessage proxyMessage = new ProxyMessage(data);
+        return proxyMessage.getEncoded();
+    }
+}
