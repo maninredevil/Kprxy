@@ -1,0 +1,35 @@
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+
+public class ByteArrayStringExtractor {
+    public static List<String> extractReadableStrings(byte[] data) {
+        List<String> result = new ArrayList<>();
+        StringBuilder currentString = new StringBuilder();
+
+        for (byte b : data) {
+            if (b >= 32 && b <= 126) {  // Печатные ASCII-символы
+                currentString.append((char) b);
+            } else {
+                if (currentString.length() >= 4) { // Минимальная длина читаемой строки
+                    result.add(currentString.toString());
+                }
+                currentString.setLength(0); // Очистка буфера
+            }
+        }
+
+        // Добавляем последнюю строку, если она есть
+        if (currentString.length() >= 4) {
+            result.add(currentString.toString());
+        }
+
+        return result;
+    }
+
+    public static void main(String[] args) {
+        byte[] data = {0x00, 0x41, 0x42, 0x43, 0x44, 0x20, 0x6B, 0x65, 0x72, 0x62, 0x65, 0x72, 0x6F, 0x73, 0x00, 0x05};
+
+        List<String> strings = extractReadableStrings(data);
+        System.out.println(strings); // [ABCD kerberos]
+    }
+}
