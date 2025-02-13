@@ -1,0 +1,51 @@
+import java.util.*;
+
+public class ByteArrayStringExtractor {
+    private static final Set<String> validPrefixes = new HashSet<>(Arrays.asList("u_"));
+    private static final Set<String> validNextWords = new HashSet<>(Arrays.asList("kerberos"));
+
+    public static String extractReadableWord(byte[] data) {
+        List<String> words = new ArrayList<>();
+        StringBuilder currentString = new StringBuilder();
+
+        for (byte b : data) {
+            char c = (char) b;
+            if (Character.isLetterOrDigit(c) || c == '_') {  // Только буквы, цифры и "_"
+                currentString.append(c);
+            } else {
+                processWord(words, currentString);
+            }
+        }
+        processWord(words, currentString); // Последнее слово
+
+        return findValidWord(words);
+    }
+
+    private static void processWord(List<String> words, StringBuilder currentString) {
+        if (currentString.length() >= 4) {  // Минимальная длина слова — 4
+            words.add(currentString.toString());
+        }
+        currentString.setLength(0);
+    }
+
+    private static String findValidWord(List<String> words) {
+        for (int i = 0; i < words.size() - 1; i++) {
+            String word = words.get(i);
+            String nextWord = words.get(i + 1);
+
+            if (!"krbtgt".equals(word) &&
+                validPrefixes.stream().anyMatch(word::startsWith) &&
+                validNextWords.contains(nextWord)) {
+                return word;
+            }
+        }
+        return null;
+    }
+
+    public static void main(String[] args) {
+        byte[] data = {0x00, 0x75, 0x5F, 0x74, 0x65, 0x73, 0x74, 0x31, 0x00, 0x6B, 0x65, 0x72, 0x62, 0x65, 0x72, 0x6F, 0x73};
+
+        String result = extractReadableWord(data);
+        System.out.println(result); // u_test1
+    }
+}
