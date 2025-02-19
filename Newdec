@@ -1,0 +1,43 @@
+import org.bouncycastle.asn1.*;
+import java.io.ByteArrayInputStream;
+
+public class KerberosParser {
+
+    public static String parseKerberosMessage(byte[] data) {
+        try (ASN1InputStream asn1Stream = new ASN1InputStream(new ByteArrayInputStream(data))) {
+            ASN1Primitive obj = asn1Stream.readObject();
+
+            if (obj instanceof ASN1Sequence) {
+                ASN1Sequence sequence = (ASN1Sequence) obj;
+                
+                // Первым элементом идет Kerberos версия (обычно 1)
+                ASN1TaggedObject taggedObj = (ASN1TaggedObject) sequence.getObjectAt(0);
+                ASN1Integer kerberosVersion = (ASN1Integer) taggedObj.getObject();
+                if (kerberosVersion.getValue().intValue() != 5) {
+                    return "Not a Kerberos v5 message";
+                }
+
+                // Второй элемент — msg-type
+                ASN1TaggedObject msgTypeTagged = (ASN1TaggedObject) sequence.getObjectAt(1);
+                ASN1Integer msgType = (ASN1Integer) msgTypeTagged.getObject();
+                int type = msgType.getValue().intValue();
+
+                switch (type) {
+                    case 10: return "AS-REQ";
+                    case 11: return "AS-REP";
+                    case 12: return "TGS-REQ";
+                    case 13: return "TGS-REP";
+                    case 14: return "AP-REQ";
+                    case 15: return "AP-REP";
+                    case 16: return "KRB-SAFE";
+                    case 17: return "KRB-PRIV";
+                    case 18: return "KRB-CRED";
+                    default: return "Unknown Kerberos message type: " + type;
+                }
+            }
+        } catch (Exception e) {
+            return "Error parsing Kerberos message: " + e.getMessage();
+        }
+        return "Invalid Kerberos message";
+    }
+}
