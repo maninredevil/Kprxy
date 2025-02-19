@@ -1,0 +1,50 @@
+import org.bouncycastle.asn1.*;
+import java.io.ByteArrayInputStream;
+
+public class KerberosParser {
+
+    public static String parseKerberosMessage(byte[] data) {
+        try (ASN1InputStream asn1Stream = new ASN1InputStream(new ByteArrayInputStream(data))) {
+            ASN1Primitive obj = asn1Stream.readObject();
+
+            if (obj instanceof ASN1Sequence) {
+                ASN1Sequence sequence = (ASN1Sequence) obj;
+
+                // Должно быть 2 элемента: [0] — Message (KDC-REQ), [1] — Realm (String)
+                if (sequence.size() != 2) {
+                    return "Invalid Kerberos message: expected 2 elements (message, realm)";
+                }
+
+                // 1. Получаем KDC-REQ (само сообщение)
+                ASN1TaggedObject messageObject = (ASN1TaggedObject) sequence.getObjectAt(0);
+                ASN1Sequence kdcReq = (ASN1Sequence) messageObject.getObject();
+
+                // 2. Ищем msg-type (обычно 2-й элемент KDC-REQ)
+                if (kdcReq.size() < 3) {
+                    return "Invalid KDC-REQ structure: too few elements";
+                }
+
+                ASN1Integer msgType = (ASN1Integer) ((ASN1TaggedObject) kdcReq.getObjectAt(1)).getObject();
+                int type = msgType.getValue().intValue();
+
+                // 3. Получаем REALM (String)
+                ASN1Encodable realmEncodable = sequence.getObjectAt(1);
+                String realm = ((ASN1String) realmEncodable).getString();
+
+                // 4. Определяем тип сообщения
+                switch (type) {
+                    case 10: return "AS-REQ (Realm: " + realm + ")";
+                    case 11: return "AS-REP (Realm: " + realm + ")";
+                    case 12: return "TGS-REQ (Realm: " + realm + ")";
+                    case 13: return "TGS-REP (Realm: " + realm + ")";
+                    case 14: return "AP-REQ (Realm: " + realm + ")";
+                    case 15: return "AP-REP (Realm: " + realm + ")";
+                    default: return "Unknown Kerberos message type: " + type + " (Realm: " + realm + ")";
+                }
+            }
+        } catch (Exception e) {
+            return "Error parsing Kerberos message: " + e.getMessage();
+        }
+        return "Invalid Kerberos message";
+    }
+}
