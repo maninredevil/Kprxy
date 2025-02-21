@@ -1,0 +1,59 @@
+import org.apache.kerby.asn1.*; import org.apache.kerby.kerberos.kerb.codec.KrbCodec; import org.apache.kerby.kerberos.kerb.type.KrbMessage; import org.apache.kerby.kerberos.kerb.type.KrbMsgType; import org.apache.kerby.kerberos.kerb.type.as.KrbAsReq; import org.apache.kerby.kerberos.kerb.type.ticket.PrincipalName;
+
+import java.util.*;
+
+public class KerberosParser { public static void main(String[] args) throws Exception { String hexData = "3081e0a081c70481c4000000c06a81bd3081..."; // Укажите полный hex-запрос byte[] data = hexStringToByteArray(hexData); parseKerberosRequest(data); }
+
+public static void parseKerberosRequest(byte[] data) throws Exception {
+    KrbMessage krbMessage = KrbCodec.decodeMessage(data);
+    System.out.println("Тип запроса: " + getRequestType(krbMessage.getMsgType()));
+    
+    if (krbMessage.getMsgType() == KrbMsgType.AS_REQ) {
+        KrbAsReq asReq = (KrbAsReq) krbMessage;
+        PrincipalName principal = asReq.getReqBody().getCname();
+        System.out.println("Принципал: " + principal.getName());
+    }
+}
+
+public static String getRequestType(KrbMsgType type) {
+    switch (type) {
+        case AS_REQ: return "KRB_AS_REQ";
+        case TGS_REQ: return "KRB_TGS_REQ";
+        case AP_REQ: return "KRB_AP_REQ";
+        default: return "Неизвестный тип";
+    }
+}
+
+public static byte[] hexStringToByteArray(String s) {
+    int len = s.length();
+    byte[] data = new byte[len / 2];
+    for (int i = 0; i < len; i += 2) {
+        data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4)
+                + Character.digit(s.charAt(i + 1), 16));
+    }
+    return data;
+}
+
+}
+<dependencies>
+    <!-- Основная библиотека Kerby ASN.1 -->
+    <dependency>
+        <groupId>org.apache.kerby</groupId>
+        <artifactId>kerby-asn1</artifactId>
+        <version>2.0.2</version>
+    </dependency>
+
+    <!-- Кодек для обработки Kerberos-сообщений -->
+    <dependency>
+        <groupId>org.apache.kerby</groupId>
+        <artifactId>kerby-kerb-codec</artifactId>
+        <version>2.0.2</version>
+    </dependency>
+
+    <!-- Библиотека для работы с Kerberos-протоколом -->
+    <dependency>
+        <groupId>org.apache.kerby</groupId>
+        <artifactId>kerby-kerb-core</artifactId>
+        <version>2.0.2</version>
+    </dependency>
+</dependencies>
