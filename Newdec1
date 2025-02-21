@@ -1,0 +1,60 @@
+import java.util.*;
+
+public class ASN1Parser { public static void main(String[] args) { String hex = "3081e0a081c70481c4000000c06a81bd3081baa103020105a20302010aa31a3018300aa10402020096a2020400300aa10402020095a2020400a4819130818ea00703050040010010a1133011a003020101a10a30081b066c79616e6f76a2141b12455352542e434c4f55442e534252462e5255a3273025a003020102a11e301c1b066b72627467741b12455352542e434c4f55442e534252462e5255a511180f32303235303232323036323830385aa7060204346edc96a814301202011402011302011202011102011a020119a1141b12455352542e434c4f55442e534252462e5255"; byte[] data = hexStringToByteArray(hex); parseASN1(data); }
+
+private static void parseASN1(byte[] data) {
+    int index = 0;
+    if (data[index] == 0x30) { // Проверяем, что это ASN.1 SEQUENCE
+        index++;
+        int length = readLength(data, index);
+        index += getLengthBytesCount(data, index);
+        System.out.println("ASN.1 Sequence detected, length: " + length);
+    }
+    
+    while (index < data.length) {
+        int tag = data[index++] & 0xFF;
+        int length = readLength(data, index);
+        int lengthBytes = getLengthBytesCount(data, index);
+        index += lengthBytes;
+        
+        if (tag == 0xA1 || tag == 0xA2 || tag == 0xA3) {
+            System.out.println("Context-specific tag: " + Integer.toHexString(tag));
+        } else if (tag == 0x02) { // INTEGER (тип запроса)
+            int requestType = data[index] & 0xFF;
+            System.out.println("Request type: " + requestType);
+        } else if (tag == 0x1B) { // GeneralString (Principal name)
+            String principal = new String(Arrays.copyOfRange(data, index, index + length));
+            System.out.println("Principal: " + principal);
+        }
+        index += length;
+    }
+}
+
+private static int readLength(byte[] data, int index) {
+    int length = data[index] & 0xFF;
+    if ((length & 0x80) != 0) {
+        int numBytes = length & 0x7F;
+        length = 0;
+        for (int i = 0; i < numBytes; i++) {
+            length = (length << 8) | (data[index + 1 + i] & 0xFF);
+        }
+    }
+    return length;
+}
+
+private static int getLengthBytesCount(byte[] data, int index) {
+    return (data[index] & 0x80) != 0 ? (data[index] & 0x7F) + 1 : 1;
+}
+
+private static byte[] hexStringToByteArray(String s) {
+    int len = s.length();
+    byte[] data = new byte[len / 2];
+    for (int i = 0; i < len; i += 2) {
+        data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4)
+                + Character.digit(s.charAt(i + 1), 16));
+    }
+    return data;
+}
+
+}
+
