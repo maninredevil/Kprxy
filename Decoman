@@ -1,0 +1,48 @@
+import java.util.*;
+
+public class KerberosParser { public static void main(String[] args) { String hexData = "3081e0a081c70481c4000000c06a81bd3081..."; // Укажите полный hex-запрос byte[] data = hexStringToByteArray(hexData); parseKerberosRequest(data); }
+
+public static void parseKerberosRequest(byte[] data) {
+    if (data.length < 2 || data[0] != 0x30) {
+        System.out.println("Неверный формат ASN.1");
+        return;
+    }
+    
+    int index = 2; // Пропускаем длину
+    while (index < data.length) {
+        if ((data[index] & 0xFF) == 0xA1) { // Ищем ключевые структуры
+            int tag = data[index + 1] & 0xFF;
+            if (tag == 0x03) {
+                int reqType = data[index + 3] & 0xFF;
+                System.out.println("Тип запроса: " + getRequestType(reqType));
+            } else if (tag == 0x13) {
+                int length = data[index + 1] & 0xFF;
+                String principal = new String(Arrays.copyOfRange(data, index + 2, index + 2 + length));
+                System.out.println("Принципал: " + principal);
+            }
+        }
+        index++;
+    }
+}
+
+public static String getRequestType(int type) {
+    switch (type) {
+        case 10: return "KRB_AS_REQ";
+        case 12: return "KRB_TGS_REQ";
+        case 14: return "KRB_AP_REQ";
+        default: return "Неизвестный тип";
+    }
+}
+
+public static byte[] hexStringToByteArray(String s) {
+    int len = s.length();
+    byte[] data = new byte[len / 2];
+    for (int i = 0; i < len; i += 2) {
+        data[i / 2] = (byte) ((Character.digit(s.charAt(i), 16) << 4)
+                + Character.digit(s.charAt(i + 1), 16));
+    }
+    return data;
+}
+
+}
+
