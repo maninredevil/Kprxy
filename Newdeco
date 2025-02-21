@@ -1,0 +1,79 @@
+import org.bouncycastle.asn1.*; import java.io.ByteArrayInputStream; import java.io.IOException; import java.util.Base64;
+
+public class KerberosRequestParser { public static void main(String[] args) throws IOException { String hexInput = "3081e0a081c70481c4000000c06a81bd3081baa103020105a20302010a..."; // HEX строка запроса byte[] requestData = hexStringToByteArray(hexInput); parseKerberosRequest(requestData); }
+
+private static void parseKerberosRequest(byte[] data) throws IOException {
+    ASN1InputStream asn1InputStream = new ASN1InputStream(new ByteArrayInputStream(data));
+    ASN1Primitive obj = asn1InputStream.readObject();
+    if (!(obj instanceof ASN1Sequence)) {
+        throw new IllegalArgumentException("Invalid ASN.1 structure");
+    }
+    ASN1Sequence sequence = (ASN1Sequence) obj;
+
+    int requestType = -1;
+    String principalName = "Unknown";
+    String realm = "Unknown";
+
+    for (ASN1Encodable element : sequence) {
+        if (element instanceof ASN1TaggedObject) {
+            ASN1TaggedObject taggedObject = (ASN1TaggedObject) element;
+            int tagNo = taggedObject.getTagNo();
+            ASN1Primitive taggedData = taggedObject.getObject();
+
+            switch (tagNo) {
+                case 3: // request type
+                    if (taggedData instanceof ASN1Integer) {
+                        requestType = ((ASN1Integer) taggedData).getValue().intValue();
+                    }
+                    break;
+                case 2: // realm
+                    if (taggedData instanceof DERIA5String || taggedData instanceof DERUTF8String) {
+                        realm = taggedData.toString();
+                    }
+                    break;
+                case 1: // principal name
+                    if (taggedData instanceof ASN1Sequence) {
+                        ASN1Sequence nameSeq = (ASN1Sequence) taggedData;
+                        principalName = extractPrincipalName(nameSeq);
+                    }
+                    break;
+            }
+        }
+    }
+
+    System.out.println("Request Type: " + getRequestTypeName(requestType));
+    System.out.println("Principal Name: " + principalName);
+    System.out.println("Realm: " + realm);
+    asn1InputStream.close();
+}
+
+private static String extractPrincipalName(ASN1Sequence nameSeq) {
+    StringBuilder sb = new StringBuilder();
+    for (ASN1Encodable encodable : nameSeq) {
+        if (encodable instanceof DERUTF8String || encodable instanceof DERIA5String) {
+            sb.append(encodable.toString()).append("/");
+        }
+    }
+    return sb.length() > 0 ? sb.substring(0, sb.length() - 1) : "Unknown";
+}
+
+private static String getRequestTypeName(int type) {
+    switch (type) {
+        case 10: return "KRB_AS_REQ (Authentication Request)";
+        case 12: return "KRB_TGS_REQ (Ticket Granting Service Request)";
+        default: return "Unknown Request Type";
+    }
+}
+
+private static byte[] hexStringToByteArray(String hex) {
+    int len = hex.length();
+    byte[] data = new byte[len / 2];
+    for (int i = 0; i < len; i += 2) {
+        data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
+                + Character.digit(hex.charAt(i+1), 16));
+    }
+    return data;
+}
+
+}
+
