@@ -1,0 +1,56 @@
+import java.io.ByteArrayInputStream; import java.io.IOException; import java.util.Arrays; import javax.xml.bind.DatatypeConverter; import java.nio.charset.StandardCharsets;
+
+public class KerberosASReqParser { public static void main(String[] args) throws IOException { String hexData = "3081e0a081c70481c4000000c06a81bd3081baa103020105a20302010aa31a3018300aa10402020096a2020400300aa10402020095a2020400a4819130818ea00703050040010010a1133011a003020101a10a30081b066c79616e6f76a2141b12455352542e434c4f55442e534252462e5255a3273025a003020102a11e301c1b066b72627467741b12455352542e434c4f55442e534252462e5255a511180f32303235303232323036323830385aa7060204346edc96a814301202011402011302011202011102011a020119a1141b12455352542e434c4f55442e534252462e5255"; byte[] data = DatatypeConverter.parseHexBinary(hexData); parseKerberosASReq(data); }
+
+public static void parseKerberosASReq(byte[] data) throws IOException {
+    ByteArrayInputStream inputStream = new ByteArrayInputStream(data);
+    int firstByte = inputStream.read();
+    if (firstByte != 0x30) { // Проверяем, что это структура ASN.1 SEQUENCE
+        throw new IOException("Неверный формат ASN.1");
+    }
+    
+    skipLength(inputStream); // Пропускаем длину
+    
+    String requestType = "Неизвестный тип запроса";
+    while (inputStream.available() > 0) {
+        int tag = inputStream.read();
+        if (tag == 0xA1) { // Ищем контекстный тег principalName
+            skipLength(inputStream);
+            extractPrincipalName(inputStream);
+        } else if (tag == 0xA1 || tag == 0xA2) { // Определение типа запроса
+            int length = inputStream.read();
+            byte[] typeBytes = new byte[length];
+            inputStream.read(typeBytes, 0, length);
+            if (typeBytes.length > 0 && typeBytes[0] == 0x05) {
+                requestType = "AS-REQ";
+            } else if (typeBytes.length > 0 && typeBytes[0] == 0x0A) {
+                requestType = "TGS-REQ";
+            }
+        }
+    }
+    System.out.println("Тип запроса: " + requestType);
+}
+
+private static void skipLength(ByteArrayInputStream inputStream) throws IOException {
+    int length = inputStream.read();
+    if (length > 127) {
+        int numBytes = length & 0x7F;
+        inputStream.skip(numBytes);
+    }
+}
+
+private static void extractPrincipalName(ByteArrayInputStream inputStream) throws IOException {
+    while (inputStream.available() > 0) {
+        int tag = inputStream.read();
+        if (tag == 0x1B) { // ASN.1 тип UTF8String
+            int length = inputStream.read();
+            byte[] nameBytes = new byte[length];
+            inputStream.read(nameBytes, 0, length);
+            String principal = new String(nameBytes, StandardCharsets.UTF_8);
+            System.out.println("Определенный принципал: " + principal);
+        }
+    }
+}
+
+}
+
