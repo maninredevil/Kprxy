@@ -1,0 +1,122 @@
+import java.nio.charset.StandardCharsets;
+
+public class ASN1Parser {
+    public static void main(String[] args) {
+        String hexInput = "3081e0a081c70481c4000000c06a81bd3081baa103020105a20302010aa31a3018300aa10402020096a2020400300aa10402020095a2020400a4819130818ea00703050040010010a1133011a003020101a10a30081b066c79616e6f76a2141b12455352542e434c4f55442e534252462e5255a3273025a003020102a11e301c1b066b72627467741b12455352542e434c4f55442e534252462e5255a511180f32303235303232323036323830385aa7060204346edc96a814301202011402011302011202011102011a020119a1141b12455352542e434c4f55442e534252462e5255";
+        byte[] data = hexToBytes(hexInput);
+        
+        parseASN1(data);
+    }
+
+    private static void parseASN1(byte[] data) {
+        int index = 0;
+
+        // Проверяем, что начинается с SEQUENCE (0x30)
+        if (data[index] != 0x30) {
+            throw new IllegalArgumentException("Неверный формат ASN.1");
+        }
+        index++;
+
+        // Читаем длину SEQUENCE
+        int length = readLength(data, index);
+        index += getLengthSize(data[index]);
+
+        // Разбираем поля
+        while (index < data.length) {
+            int tag = data[index] & 0xFF;
+            index++;
+
+            int len = readLength(data, index);
+            int lenSize = getLengthSize(data[index]);
+            index += lenSize;
+
+            switch (tag) {
+                case 0xA1: // pvno
+                    System.out.println("pvno: " + data[index + 2]);
+                    break;
+                case 0xA2: // msg-type
+                    System.out.println("msg-type: " + data[index + 2]);
+                    break;
+                case 0xA3: // KDC-REQ-BODY
+                    index = parseKDCReqBody(data, index, len);
+                    break;
+                default:
+                    index += len; // Пропускаем неизвестные теги
+            }
+        }
+    }
+
+    private static int parseKDCReqBody(byte[] data, int index, int length) {
+        int end = index + length;
+
+        while (index < end) {
+            int tag = data[index] & 0xFF;
+            index++;
+
+            int len = readLength(data, index);
+            int lenSize = getLengthSize(data[index]);
+            index += lenSize;
+
+            switch (tag) {
+                case 0xA1: // Client Principal Name
+                    String cname = extractString(data, index);
+                    System.out.println("Client Principal: " + cname);
+                    break;
+                case 0xA2: // Realm
+                    String realm = extractString(data, index);
+                    System.out.println("Realm: " + realm);
+                    break;
+                case 0xA3: // Server Principal Name
+                    String sname = extractString(data, index + 6);
+                    System.out.println("Server Principal: " + sname);
+                    break;
+                case 0xA5: // Timestamp
+                    String timestamp = extractString(data, index);
+                    System.out.println("Timestamp: " + timestamp);
+                    break;
+                case 0xA7: // Nonce
+                    int nonce = ((data[index] & 0xFF) << 24) | ((data[index + 1] & 0xFF) << 16) |
+                                ((data[index + 2] & 0xFF) << 8) | (data[index + 3] & 0xFF);
+                    System.out.println("Nonce: " + nonce);
+                    break;
+                default:
+                    index += len; // Пропускаем неизвестные теги
+            }
+        }
+
+        return end;
+    }
+
+    private static int readLength(byte[] data, int index) {
+        int length = data[index] & 0xFF;
+        if (length < 0x80) {
+            return length;
+        } else {
+            int numBytes = length - 0x80;
+            int result = 0;
+            for (int i = 0; i < numBytes; i++) {
+                result = (result << 8) | (data[index + i + 1] & 0xFF);
+            }
+            return result;
+        }
+    }
+
+    private static int getLengthSize(byte lengthByte) {
+        return (lengthByte & 0x80) == 0 ? 1 : (lengthByte & 0x7F) + 1;
+    }
+
+    private static String extractString(byte[] data, int index) {
+        int length = data[index] & 0xFF;
+        return new String(data, index + 2, length, StandardCharsets.UTF_8);
+    }
+
+    private static byte[] hexToBytes(String hex) {
+        int len = hex.length();
+        byte[] data = new byte[len / 2];
+        for (int i = 0; i < len; i += 2) {
+            data[i / 2] = (byte) ((Character.digit(hex.charAt(i), 16) << 4)
+                    + Character.digit(hex.charAt(i + 1), 16));
+        }
+        return data;
+    }
+}
