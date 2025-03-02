@@ -1,6 +1,134 @@
 import org.jfree.chart.ChartFactory;
 import org.jfree.chart.ChartUtils;
 import org.jfree.chart.JFreeChart;
+import org.jfree.chart.annotations.CategoryTextAnnotation;
+import org.jfree.chart.axis.CategoryAxis;
+import org.jfree.chart.axis.NumberAxis;
+import org.jfree.chart.plot.CategoryPlot;
+import org.jfree.chart.renderer.category.LineAndShapeRenderer;
+import org.jfree.data.category.CategoryDataset;
+import org.jfree.data.category.DefaultCategoryDataset;
+
+import java.awt.*;
+import java.io.File;
+import java.io.IOException;
+import java.util.Comparator;
+import java.util.List;
+
+public class PriceChartGenerator {
+
+    public static void main(String[] args) {
+        // Пример данных
+        List<DataEntry> product1Data = List.of(
+                new DataEntry(1200.5, "2024-02-25"),
+                new DataEntry(1250.0, "2024-02-26"),
+                new DataEntry(1300.0, "2024-02-27"),
+                new DataEntry(1290.0, "2024-02-28")
+        );
+
+        generateChart("Товар1", product1Data);
+    }
+
+    public static void generateChart(String productName, List<DataEntry> data) {
+        if (data.isEmpty()) return;
+
+        String filename = productName.replace(" ", "_") + ".png";
+
+        // Сортируем данные по дате
+        data.sort(Comparator.comparing(entry -> entry.date));
+
+        // Определяем минимальную цену
+        double minPrice = data.stream().mapToDouble(e -> e.price).min().orElse(0);
+        double yAxisMin = Math.max(0, minPrice - 500);
+
+        // Ограничиваем максимальный размер изображения
+        int width = Math.min(1600, Math.max(800, 200 * data.size()));  
+        int height = 500;
+
+        // Создаем набор данных
+        DefaultCategoryDataset dataset = new DefaultCategoryDataset();
+        for (DataEntry entry : data) {
+            dataset.addValue(entry.price, "Цена", entry.date);
+        }
+
+        // Создаем график
+        JFreeChart chart = ChartFactory.createLineChart(
+                "Изменение цены: " + productName, 
+                "Дата",                          
+                "Цена",                          
+                dataset
+        );
+
+        // Настройка стилей
+        CategoryPlot plot = (CategoryPlot) chart.getPlot();
+        plot.setBackgroundPaint(Color.WHITE);
+        plot.setDomainGridlinePaint(Color.LIGHT_GRAY);
+        plot.setRangeGridlinePaint(Color.GRAY);
+
+        // Установка минимального значения оси Y
+        NumberAxis yAxis = (NumberAxis) plot.getRangeAxis();
+        yAxis.setLowerBound(yAxisMin);
+
+        // Линии и точки
+        LineAndShapeRenderer renderer = new LineAndShapeRenderer();
+        renderer.setSeriesPaint(0, Color.BLUE);
+        renderer.setSeriesStroke(0, new BasicStroke(2.5f));
+        plot.setRenderer(renderer);
+
+        // **Настройка вертикального отображения дат**
+        CategoryAxis xAxis = plot.getDomainAxis();
+        xAxis.setCategoryLabelPositions(CategoryAxis.DEFAULT_CATEGORY_LABEL_POSITIONS.rotate90());
+
+        // **Добавляем разницу цен над точками**
+        for (int i = 1; i < data.size(); i++) {
+            double prevPrice = data.get(i - 1).price;
+            double currPrice = data.get(i).price;
+            double change = currPrice - prevPrice;
+
+            String changeText = String.format("%+.2f", change); // Форматируем изменение цены
+            CategoryTextAnnotation annotation = new CategoryTextAnnotation(changeText, data.get(i).date, currPrice + 10);
+            annotation.setFont(new Font("Arial", Font.BOLD, 12));
+            annotation.setPaint(change > 0 ? Color.GREEN : Color.RED); // Зеленый если цена выросла, красный если упала
+            plot.addAnnotation(annotation);
+        }
+
+        // Освобождаем память перед сохранением
+        System.gc();
+
+        // Сохранение в файл
+        saveChartAsImage(chart, filename, width, height);
+
+        // Очистка памяти после работы
+        chart = null;
+        System.gc();
+    }
+
+    private static void saveChartAsImage(JFreeChart chart, String filename, int width, int height) {
+        File imageFile = new File(filename);
+        try {
+            ChartUtils.saveChartAsPNG(imageFile, chart, width, height);
+            System.out.println("График сохранен: " + imageFile.getAbsolutePath());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Класс для хранения данных (цена + дата)
+    static class DataEntry {
+        double price;
+        String date;
+
+        public DataEntry(double price, String date) {
+            this.price = price;
+            this.date = date;
+        }
+    }
+}
+
+
+import org.jfree.chart.ChartFactory;
+import org.jfree.chart.ChartUtils;
+import org.jfree.chart.JFreeChart;
 import org.jfree.chart.plot.CategoryPlot;
 import org.jfree.chart.renderer.category.LineAndShapeRenderer;
 import org.jfree.data.category.CategoryDataset;
