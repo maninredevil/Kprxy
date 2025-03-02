@@ -101,3 +101,123 @@ public class PriceChartGenerator {
         }
     }
 }
+
+
+
+
+import org.jfree.chart.ChartFactory;
+import org.jfree.chart.ChartUtils;
+import org.jfree.chart.JFreeChart;
+import org.jfree.chart.plot.CategoryPlot;
+import org.jfree.chart.renderer.category.LineAndShapeRenderer;
+import org.jfree.data.category.CategoryDataset;
+import org.jfree.data.category.DefaultCategoryDataset;
+
+import java.awt.*;
+import java.io.File;
+import java.io.IOException;
+import java.util.Comparator;
+import java.util.List;
+
+public class PriceChartGenerator {
+
+    public static void main(String[] args) {
+        // Пример: у каждого товара свой список данных (цена + дата)
+        List<DataEntry> product1Data = List.of(
+                new DataEntry(120.5, "2024-02-25"),
+                new DataEntry(125.0, "2024-02-26"),
+                new DataEntry(130.0, "2024-02-27")
+        );
+
+        List<DataEntry> product2Data = List.of(
+                new DataEntry(98.0, "2024-02-25"),
+                new DataEntry(102.5, "2024-02-26"),
+                new DataEntry(110.3, "2024-02-27")
+        );
+
+        List<DataEntry> product3Data = List.of(
+                new DataEntry(150.75, "2024-02-25"),
+                new DataEntry(149.9, "2024-02-26"),
+                new DataEntry(148.5, "2024-02-27")
+        );
+
+        // Генерируем графики для каждого товара
+        generateChart("Товар1", product1Data);
+        generateChart("Товар2", product2Data);
+        generateChart("Товар3", product3Data);
+    }
+
+    // Метод строит график для одного товара
+    public static void generateChart(String productName, List<DataEntry> data) {
+        if (data.isEmpty()) return;
+
+        String filename = productName.replace(" ", "_") + ".png";
+
+        // Сортируем данные по дате
+        data.sort(Comparator.comparing(entry -> entry.date));
+
+        // Динамический размер изображения
+        int width = Math.max(800, 200 * data.size());
+        int height = 500;
+
+        // Создаем набор данных
+        CategoryDataset dataset = createDataset(data);
+
+        // Создаем график
+        JFreeChart chart = ChartFactory.createLineChart(
+                "Изменение цены: " + productName, // Заголовок
+                "Дата",                          // Ось X
+                "Цена",                          // Ось Y
+                dataset
+        );
+
+        // Настройка стилей
+        CategoryPlot plot = (CategoryPlot) chart.getPlot();
+        plot.setBackgroundPaint(Color.WHITE);
+        plot.setDomainGridlinePaint(Color.LIGHT_GRAY);
+        plot.setRangeGridlinePaint(Color.GRAY);
+
+        // Линии и точки
+        LineAndShapeRenderer renderer = new LineAndShapeRenderer();
+        renderer.setSeriesPaint(0, Color.BLUE);
+        renderer.setSeriesStroke(0, new BasicStroke(2.5f));
+        plot.setRenderer(renderer);
+
+        // Настройка шрифтов
+        chart.getTitle().setFont(new Font("Arial", Font.BOLD, 18));
+        plot.getDomainAxis().setTickLabelFont(new Font("Arial", Font.PLAIN, 14));
+        plot.getRangeAxis().setTickLabelFont(new Font("Arial", Font.PLAIN, 14));
+
+        // Сохранение в файл
+        saveChartAsImage(chart, filename, width, height);
+    }
+
+    private static CategoryDataset createDataset(List<DataEntry> data) {
+        DefaultCategoryDataset dataset = new DefaultCategoryDataset();
+        for (DataEntry entry : data) {
+            dataset.addValue(entry.price, "Цена", entry.date);
+        }
+        return dataset;
+    }
+
+    private static void saveChartAsImage(JFreeChart chart, String filename, int width, int height) {
+        File imageFile = new File(filename);
+        try {
+            ChartUtils.saveChartAsPNG(imageFile, chart, width, height);
+            System.out.println("График сохранен: " + imageFile.getAbsolutePath());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    // Класс для хранения данных (цена + дата)
+    static class DataEntry {
+        double price;
+        String date;
+
+        public DataEntry(double price, String date) {
+            this.price = price;
+            this.date = date;
+        }
+    }
+}
