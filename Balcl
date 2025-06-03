@@ -1,3 +1,352 @@
+Вы правы, давайте перепроверю код и внесу необходимые исправления:
+
+```java
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
+
+public class HighPerformanceLoadBalancer {
+    
+    // Константы
+    private static final int RESPONSE_TIME_WINDOW_SIZE = 1000; // Размер окна для хранения времен ответа
+    private static final long STATS_WINDOW_MS = 300_000; // 5 минут в миллисекундах
+    
+    // Стратегии балансировки
+    public enum Strategy {
+        ROUND_ROBIN,
+        LEAST_CONNECTIONS,
+        WEIGHTED_RESPONSE_TIME,
+        RANDOM
+    }
+    
+    private volatile Strategy strategy = Strategy.WEIGHTED_RESPONSE_TIME;
+    private final Map<String, HostData> hostsMap = new ConcurrentHashMap<>();
+    private volatile String[] hostsList = new String[0]; // Атомарно обновляемый список хостов
+    private final AtomicInteger roundRobinCounter = new AtomicInteger(0);
+    
+    // Класс для хранения данных о хосте с оптимизацией для высокой нагрузки
+    private static class HostData {
+        private final String host;
+        private final AtomicReferenceArray<ResponseTime> responseTimes;
+        private final AtomicInteger responseTimeIndex = new AtomicInteger(0);
+        private final AtomicInteger activeConnections = new AtomicInteger(0);
+        private final AtomicInteger requestCount = new AtomicInteger(0);
+        
+        // Кэшированное значение среднего времени ответа
+        private volatile double cachedAvgResponseTime = 0;
+        private volatile long lastAvgCalculationTime = 0;
+        private static final long AVG_CACHE_DURATION_MS = 1000; // Обновлять среднее не чаще раза в секунду
+        
+        public HostData(String host) {
+            this.host = host;
+            this.responseTimes = new AtomicReferenceArray<>(RESPONSE_TIME_WINDOW_SIZE);
+        }
+        
+        public void recordResponseTime(long responseTimeMs) {
+            int index = responseTimeIndex.getAndIncrement() % RESPONSE_TIME_WINDOW_SIZE;
+            responseTimes.set(index, new ResponseTime(System.currentTimeMillis(), responseTimeMs));
+            activeConnections.decrementAndGet();
+        }
+        
+        public void incrementConnections() {
+            activeConnections.incrementAndGet();
+            requestCount.incrementAndGet();
+        }
+        
+        public int getActiveConnections() {
+            return activeConnections.get();
+        }
+        
+        public double getAverageResponseTime() {
+            long now = System.currentTimeMillis();
+            
+            // Используем кэшированное значение, если оно достаточно свежее
+            if (now - lastAvgCalculationTime < AVG_CACHE_DURATION_MS) {
+                return cachedAvgResponseTime;
+            }
+            
+            // Иначе пересчитываем среднее время ответа
+            long cutoffTime = now - STATS_WINDOW_MS;
+            long sum = 0;
+            int count = 0;
+            
+            for (int i = 0; i < RESPONSE_TIME_WINDOW_SIZE; i++) {
+                ResponseTime rt = responseTimes.get(i);
+                if (rt != null && rt.timestamp > cutoffTime) {
+                    sum += rt.responseTimeMs;
+                    count++;
+                }
+            }
+            
+            double avg = count > 0 ? (double) sum / count : 0;
+            cachedAvgResponseTime = avg;
+            lastAvgCalculationTime = now;
+            
+            return avg;
+        }
+    }
+    
+    private static class ResponseTime {
+        final long timestamp;
+        final long responseTimeMs;
+        
+        ResponseTime(long timestamp, long responseTimeMs) {
+            this.timestamp = timestamp;
+            this.responseTimeMs = responseTimeMs;
+        }
+    }
+    
+    // Добавление хоста
+    public void addHost(String host) {
+        if (host == null || host.isEmpty()) {
+            throw new IllegalArgumentException("Host cannot be null or empty");
+        }
+        
+        if (!hostsMap.containsKey(host)) {
+            hostsMap.put(host, new HostData(host));
+            updateHostsList();
+        }
+    }
+    
+    // Удаление хоста
+    public boolean removeHost(String host) {
+        if (host == null) {
+            return false;
+        }
+        
+        if (hostsMap.remove(host) != null) {
+            updateHostsList();
+            return true;
+        }
+        return false;
+    }
+    
+    // Атомарное обновление списка хостов
+    private void updateHostsList() {
+        hostsList = hostsMap.keySet().toArray(new String[0]);
+    }
+    
+    // Установка стратегии балансировки
+    public void setStrategy(Strategy strategy) {
+        if (strategy != null) {
+            this.strategy = strategy;
+        }
+    }
+    
+    // Получение хоста для запроса
+    public String getHost() {
+        String[] currentHosts = hostsList;
+        if (currentHosts.length == 0) {
+            throw new IllegalStateException("No hosts available");
+        }
+        
+        if (currentHosts.length == 1) {
+            String host = currentHosts[0];
+            hostsMap.get(host).incrementConnections();
+            return host;
+        }
+        
+        String selectedHost;
+        Strategy currentStrategy = this.strategy; // Локальная копия для потокобезопасности
+        
+        switch (currentStrategy) {
+            case ROUND_ROBIN:
+                selectedHost = roundRobinStrategy(currentHosts);
+                break;
+            case LEAST_CONNECTIONS:
+                selectedHost = leastConnectionsStrategy(currentHosts);
+                break;
+            case WEIGHTED_RESPONSE_TIME:
+                selectedHost = weightedResponseTimeStrategy(currentHosts);
+                break;
+            case RANDOM:
+                selectedHost = randomStrategy(currentHosts);
+                break;
+            default:
+                selectedHost = weightedResponseTimeStrategy(currentHosts);
+        }
+        
+        HostData hostData = hostsMap.get(selectedHost);
+        if (hostData != null) { // Проверка на случай, если хост был удален между выбором и инкрементом
+            hostData.incrementConnections();
+        }
+        return selectedHost;
+    }
+    
+    // Регистрация времени ответа хоста
+    public void registerResponseTime(String host, long responseTimeMs) {
+        if (host == null || responseTimeMs < 0) {
+            return; // Игнорируем некорректные данные
+        }
+        
+        HostData hostData = hostsMap.get(host);
+        if (hostData != null) {
+            hostData.recordResponseTime(responseTimeMs);
+        }
+    }
+    
+    // Стратегия Round Robin с оптимизацией
+    private String roundRobinStrategy(String[] hosts) {
+        // Используем побитовую операцию для обеспечения положительного значения
+        // и избежания переполнения при большом количестве запросов
+        int index = roundRobinCounter.getAndIncrement() & 0x7FFFFFFF;
+        return hosts[index % hosts.length];
+    }
+    
+    // Стратегия наименьшего количества соединений
+    private String leastConnectionsStrategy(String[] hosts) {
+        if (hosts.length <= 3) {
+            // Для небольшого числа хостов проверяем все
+            String selectedHost = hosts[0];
+            int minConnections = Integer.MAX_VALUE;
+            
+            for (String host : hosts) {
+                HostData hostData = hostsMap.get(host);
+                if (hostData != null) {
+                    int connections = hostData.getActiveConnections();
+                    if (connections < minConnections) {
+                        minConnections = connections;
+                        selectedHost = host;
+                    }
+                }
+            }
+            
+            return selectedHost;
+        } else {
+            // Для большого числа хостов используем выборку
+            String selectedHost = hosts[0];
+            HostData hostData = hostsMap.get(selectedHost);
+            int minConnections = hostData != null ? hostData.getActiveConnections() : Integer.MAX_VALUE;
+            
+            // Проверяем несколько случайных хостов
+            int samplesToCheck = Math.min(hosts.length, 3);
+            
+            for (int i = 0; i < samplesToCheck; i++) {
+                int randomIndex = ThreadLocalRandom.current().nextInt(hosts.length);
+                String host = hosts[randomIndex];
+                HostData data = hostsMap.get(host);
+                
+                if (data != null) {
+                    int connections = data.getActiveConnections();
+                    if (connections < minConnections) {
+                        minConnections = connections;
+                        selectedHost = host;
+                    }
+                }
+            }
+            
+            return selectedHost;
+        }
+    }
+    
+    // Стратегия взвешенного времени ответа с оптимизацией
+    private String weightedResponseTimeStrategy(String[] hosts) {
+        // Используем алгоритм "Power of Two Choices" для эффективности
+        int idx1 = ThreadLocalRandom.current().nextInt(hosts.length);
+        int idx2 = ThreadLocalRandom.current().nextInt(hosts.length);
+        
+        // Убедимся, что индексы различны при наличии более одного хоста
+        if (idx1 == idx2 && hosts.length > 1) {
+            idx2 = (idx2 + 1) % hosts.length;
+        }
+        
+        String host1 = hosts[idx1];
+        String host2 = hosts[idx2];
+        
+        HostData data1 = hostsMap.get(host1);
+        HostData data2 = hostsMap.get(host2);
+        
+        // Проверка на null (на случай, если хост был удален)
+        if (data1 == null) return host2;
+        if (data2 == null) return host1;
+        
+        double rt1 = data1.getAverageResponseTime();
+        double rt2 = data2.getAverageResponseTime();
+        
+        // Если нет статистики, используем соединения
+        if (rt1 <= 0 && rt2 <= 0) {
+            int conn1 = data1.getActiveConnections();
+            int conn2 = data2.getActiveConnections();
+            return conn1 <= conn2 ? host1 : host2;
+        }
+        
+        // Если у одного хоста нет статистики
+        if (rt1 <= 0) return host2;
+        if (rt2 <= 0) return host1;
+        
+        // Выбираем хост с лучшим временем ответа, но с небольшой вероятностью
+        // выбираем другой хост для обеспечения плавной балансировки
+        double ratio = rt1 / rt2;
+        double probability = 1.0 / (1.0 + ratio); // Вероятность выбора первого хоста
+        
+        return ThreadLocalRandom.current().nextDouble() < probability ? host1 : host2;
+    }
+    
+    // Стратегия случайного выбора
+    private String randomStrategy(String[] hosts) {
+        int randomIndex = ThreadLocalRandom.current().nextInt(hosts.length);
+        return hosts[randomIndex];
+    }
+    
+    // Получение базовой статистики
+    public Map<String, HostStats> getBasicStats() {
+        Map<String, HostStats> stats = new ConcurrentHashMap<>();
+        
+        for (Map.Entry<String, HostData> entry : hostsMap.entrySet()) {
+            HostData data = entry.getValue();
+            stats.put(entry.getKey(), new HostStats(
+                data.getActiveConnections(),
+                data.getAverageResponseTime()
+            ));
+        }
+        
+        return stats;
+    }
+    
+    // Легковесный класс для возврата статистики
+    public static class HostStats {
+        public final int activeConnections;
+        public final double avgResponseTime;
+        
+        public HostStats(int activeConnections, double avgResponseTime) {
+            this.activeConnections = activeConnections;
+            this.avgResponseTime = avgResponseTime;
+        }
+    }
+}
+```
+
+Внесенные исправления и улучшения:
+
+1. **Проверка входных данных**:
+   - Добавлены проверки на null и пустые строки при добавлении хостов
+   - Добавлена проверка на отрицательное время ответа
+
+2. **Улучшение потокобезопасности**:
+   - Создание локальной копии стратегии перед использованием
+   - Проверка на null перед инкрементом соединений
+
+3. **Исправление алгоритма Round Robin**:
+   - Использование 0x7FFFFFFF вместо Integer.MAX_VALUE для более четкой побитовой операции
+
+4. **Улучшение стратегии Least Connections**:
+   - Добавлена оптимизация для малого числа хостов
+   - Добавлены проверки на null
+
+5. **Улучшение стратегии Weighted Response Time**:
+   - Гарантия выбора разных хостов при наличии более одного хоста
+   - Улучшенная формула вероятности выбора хоста на основе соотношения времен ответа
+   - Добавлены проверки на null
+
+6. **Общие улучшения**:
+   - Более надежная обработка краевых случаев
+   - Улучшенная защита от гонок данных
+
+Эта версия должна быть более надежной и производительной для высоконагруженных систем.
+
+
 Вот оптимизированная версия балансировщика для высоконагруженных систем с 30+ тыс. запросов в секунду:
 
 ```java
