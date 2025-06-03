@@ -1,0 +1,182 @@
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.stereotype.Component;
+import org.springframework.scheduling.annotation.Scheduled;
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Logger;
+import java.util.logging.Level;
+
+@Component
+public class ConfigMonitorComponent {
+    
+    private static final Logger logger = Logger.getLogger(ConfigMonitorComponent.class.getName());
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    
+    // Путь к файлу конфигурации 
+    private final String configFilePath = "config.json";
+    
+    // Текущие настройки (потокобезопасно)
+    private final AtomicReference<ConfigSettings> currentSettings = new AtomicReference<>();
+    
+    // Время последнего изменения файла
+    private long lastModified = 0;
+    
+    @PostConstruct
+    public void init() {
+        logger.info("Инициализация компонента мониторинга конфигурации");
+        loadConfiguration();
+    }
+    
+    @Scheduled(fixedDelay = 10000) // Каждые 10 секунд
+    public void monitorConfiguration() {
+        try {
+            Path configPath = Paths.get(configFilePath);
+            
+            if (!Files.exists(configPath)) {
+                logger.warning("Файл конфигурации не найден: " + configFilePath);
+                return;
+            }
+            
+            long currentModified = Files.getLastModifiedTime(configPath).toMillis();
+            
+            // Проверяем, изменился ли файл
+            if (currentModified != lastModified) {
+                logger.info("Обнаружены изменения в файле конфигурации, перезагружаем...");
+                loadConfiguration();
+                lastModified = currentModified;
+            }
+            
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "Ошибка при мониторинге файла конфигурации", e);
+        }
+    }
+    
+    private void loadConfiguration() {
+        try {
+            File configFile = new File(configFilePath);
+            
+            if (!configFile.exists()) {
+                logger.warning("Файл конфигурации не существует: " + configFilePath);
+                return;
+            }
+            
+            JsonNode rootNode = objectMapper.readTree(configFile);
+            ConfigSettings newSettings = parseConfiguration(rootNode);
+            
+            ConfigSettings oldSettings = currentSettings.getAndSet(newSettings);
+            
+            if (oldSettings == null) {
+                logger.info("Конфигурация загружена впервые");
+            } else {
+                logger.info("Конфигурация обновлена");
+            }
+            
+            logCurrentSettings(newSettings);
+            
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "Ошибка при загрузке конфигурации", e);
+        } catch (Exception e) {
+            logger.log(Level.SEVERE, "Ошибка при парсинге конфигурации", e);
+        }
+    }
+    
+    private ConfigSettings parseConfiguration(JsonNode rootNode) {
+        ConfigSettings settings = new ConfigSettings();
+        
+        // Парсим секцию Default
+        JsonNode defaultNode = rootNode.get("Default");
+        if (defaultNode != null) {
+            settings.ip = defaultNode.has("Ip") ? defaultNode.get("Ip").asText() : "";
+            settings.count = defaultNode.has("Count") ? defaultNode.get("Count").asInt() : 0;
+            settings.kek = defaultNode.has("Kek") ? defaultNode.get("Kek").asText() : "";
+        }
+        
+        // Парсим секцию Ban
+        JsonNode banNode = rootNode.get("Ban");
+        if (banNode != null && banNode.isArray()) {
+            settings.banList = new ArrayList<>();
+            for (JsonNode banItem : banNode) {
+                BanItem ban = new BanItem();
+                ban.type = banItem.has("Type") ? banItem.get("Type").asText() : "";
+                ban.obj = banItem.has("Obj") ? banItem.get("Obj").asText() : "";
+                settings.banList.add(ban);
+            }
+        }
+        
+        return settings;
+    }
+    
+    private void logCurrentSettings(ConfigSettings settings) {
+        logger.info("=== Текущие настройки ===");
+        logger.info("IP: " + settings.ip);
+        logger.info("Count: " + settings.count);
+        logger.info("Kek: " + settings.kek);
+        logger.info("Ban список: " + (settings.banList != null ? settings.banList.size() + " элементов" : "пустой"));
+        
+        if (settings.banList != null) {
+            for (int i = 0; i < settings.banList.size(); i++) {
+                BanItem ban = settings.banList.get(i);
+                logger.info("  Ban[" + i + "]: Type=" + ban.type + ", Obj=" + ban.obj);
+            }
+        }
+    }
+    
+    // Публичные методы для получения настроек
+    public String getIp() {
+        ConfigSettings settings = currentSettings.get();
+        return settings != null ? settings.ip : "";
+    }
+    
+    public int getCount() {
+        ConfigSettings settings = currentSettings.get();
+        return settings != null ? settings.count : 0;
+    }
+    
+    public String getKek() {
+        ConfigSettings settings = currentSettings.get();
+        return settings != null ? settings.kek : "";
+    }
+    
+    public List<BanItem> getBanList() {
+        ConfigSettings settings = currentSettings.get();
+        return settings != null ? new ArrayList<>(settings.banList) : new ArrayList<>();
+    }
+    
+    public boolean isBanned(String type, String obj) {
+        List<BanItem> banList = getBanList();
+        return banList.stream()
+                .anyMatch(ban -> ban.type.equals(type) && ban.obj.equals(obj));
+    }
+    
+    @PreDestroy
+    public void destroy() {
+        logger.info("Компонент мониторинга конфигурации останавливается");
+    }
+    
+    // Вложенные классы для хранения конфигурации
+    private static class ConfigSettings {
+        String ip = "";
+        int count = 0;
+        String kek = "";
+        List<BanItem> banList = new ArrayList<>();
+    }
+    
+    public static class BanItem {
+        public String type = "";
+        public String obj = "";
+        
+        @Override
+        public String toString() {
+            return "BanItem{type='" + type + "', obj='" + obj + "'}";
+        }
+    }
+}
