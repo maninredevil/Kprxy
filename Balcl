@@ -1,3 +1,277 @@
+Вот реализация балансировщика на Java с несколькими стратегиями балансировки:
+
+```java
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+public class LoadBalancer {
+    
+    private final Map<String, HostStats> hostsStats = new ConcurrentHashMap<>();
+    private final ReadWriteLock hostsLock = new ReentrantReadWriteLock();
+    private BalancingStrategy strategy = BalancingStrategy.WEIGHTED_RESPONSE_TIME;
+    
+    // Интерфейс для стратегий балансировки
+    public enum BalancingStrategy {
+        ROUND_ROBIN,
+        LEAST_CONNECTIONS,
+        WEIGHTED_RESPONSE_TIME,
+        RANDOM
+    }
+    
+    // Класс для хранения статистики хоста
+    private static class HostStats {
+        private final String host;
+        private final Queue<ResponseTime> responseTimes = new ConcurrentLinkedQueue<>();
+        private int activeConnections = 0;
+        private int requestCount = 0;
+        
+        public HostStats(String host) {
+            this.host = host;
+        }
+        
+        public void addResponseTime(long responseTimeMs) {
+            responseTimes.add(new ResponseTime(Instant.now(), responseTimeMs));
+            cleanupOldStats();
+        }
+        
+        public double getAverageResponseTime() {
+            cleanupOldStats();
+            if (responseTimes.isEmpty()) {
+                return 0;
+            }
+            
+            return responseTimes.stream()
+                    .mapToLong(ResponseTime::getResponseTimeMs)
+                    .average()
+                    .orElse(0);
+        }
+        
+        private void cleanupOldStats() {
+            Instant fiveMinutesAgo = Instant.now().minus(Duration.ofMinutes(5));
+            responseTimes.removeIf(rt -> rt.getTimestamp().isBefore(fiveMinutesAgo));
+        }
+        
+        public void incrementConnections() {
+            activeConnections++;
+            requestCount++;
+        }
+        
+        public void decrementConnections() {
+            activeConnections--;
+        }
+        
+        public int getActiveConnections() {
+            return activeConnections;
+        }
+        
+        public int getRequestCount() {
+            return requestCount;
+        }
+    }
+    
+    private static class ResponseTime {
+        private final Instant timestamp;
+        private final long responseTimeMs;
+        
+        public ResponseTime(Instant timestamp, long responseTimeMs) {
+            this.timestamp = timestamp;
+            this.responseTimeMs = responseTimeMs;
+        }
+        
+        public Instant getTimestamp() {
+            return timestamp;
+        }
+        
+        public long getResponseTimeMs() {
+            return responseTimeMs;
+        }
+    }
+    
+    // Добавление нового хоста
+    public void addHost(String host) {
+        hostsLock.writeLock().lock();
+        try {
+            hostsStats.putIfAbsent(host, new HostStats(host));
+        } finally {
+            hostsLock.writeLock().unlock();
+        }
+    }
+    
+    // Удаление хоста
+    public boolean removeHost(String host) {
+        hostsLock.writeLock().lock();
+        try {
+            return hostsStats.remove(host) != null;
+        } finally {
+            hostsLock.writeLock().unlock();
+        }
+    }
+    
+    // Установка стратегии балансировки
+    public void setStrategy(BalancingStrategy strategy) {
+        this.strategy = strategy;
+    }
+    
+    // Получение хоста для запроса
+    public String getHost() {
+        hostsLock.readLock().lock();
+        try {
+            if (hostsStats.isEmpty()) {
+                throw new IllegalStateException("No hosts available");
+            }
+            
+            String selectedHost;
+            
+            switch (strategy) {
+                case ROUND_ROBIN:
+                    selectedHost = roundRobinStrategy();
+                    break;
+                case LEAST_CONNECTIONS:
+                    selectedHost = leastConnectionsStrategy();
+                    break;
+                case WEIGHTED_RESPONSE_TIME:
+                    selectedHost = weightedResponseTimeStrategy();
+                    break;
+                case RANDOM:
+                    selectedHost = randomStrategy();
+                    break;
+                default:
+                    selectedHost = weightedResponseTimeStrategy();
+            }
+            
+            hostsStats.get(selectedHost).incrementConnections();
+            return selectedHost;
+        } finally {
+            hostsLock.readLock().unlock();
+        }
+    }
+    
+    // Регистрация времени ответа хоста
+    public void registerResponseTime(String host, long responseTimeMs) {
+        hostsLock.readLock().lock();
+        try {
+            HostStats stats = hostsStats.get(host);
+            if (stats != null) {
+                stats.addResponseTime(responseTimeMs);
+                stats.decrementConnections();
+            }
+        } finally {
+            hostsLock.readLock().unlock();
+        }
+    }
+    
+    // Стратегия Round Robin
+    private String roundRobinStrategy() {
+        List<String> hosts = new ArrayList<>(hostsStats.keySet());
+        int minRequests = Integer.MAX_VALUE;
+        String selectedHost = hosts.get(0);
+        
+        for (String host : hosts) {
+            HostStats stats = hostsStats.get(host);
+            if (stats.getRequestCount() < minRequests) {
+                minRequests = stats.getRequestCount();
+                selectedHost = host;
+            }
+        }
+        
+        return selectedHost;
+    }
+    
+    // Стратегия наименьшего количества соединений
+    private String leastConnectionsStrategy() {
+        List<String> hosts = new ArrayList<>(hostsStats.keySet());
+        int minConnections = Integer.MAX_VALUE;
+        String selectedHost = hosts.get(0);
+        
+        for (String host : hosts) {
+            HostStats stats = hostsStats.get(host);
+            if (stats.getActiveConnections() < minConnections) {
+                minConnections = stats.getActiveConnections();
+                selectedHost = host;
+            }
+        }
+        
+        return selectedHost;
+    }
+    
+    // Стратегия взвешенного времени ответа
+    private String weightedResponseTimeStrategy() {
+        List<String> hosts = new ArrayList<>(hostsStats.keySet());
+        
+        // Если у нас мало статистики, используем случайный выбор
+        boolean hasStats = hosts.stream()
+                .anyMatch(host -> hostsStats.get(host).getAverageResponseTime() > 0);
+        
+        if (!hasStats) {
+            return randomStrategy();
+        }
+        
+        // Вычисляем веса на основе обратного времени ответа
+        Map<String, Double> weights = new HashMap<>();
+        double totalWeight = 0;
+        
+        for (String host : hosts) {
+            double avgResponseTime = hostsStats.get(host).getAverageResponseTime();
+            // Избегаем деления на ноль
+            double weight = avgResponseTime <= 0 ? 1.0 : 1.0 / avgResponseTime;
+            weights.put(host, weight);
+            totalWeight += weight;
+        }
+        
+        // Выбираем хост на основе весов
+        double random = Math.random() * totalWeight;
+        double cumulativeWeight = 0;
+        
+        for (String host : hosts) {
+            cumulativeWeight += weights.get(host);
+            if (random <= cumulativeWeight) {
+                return host;
+            }
+        }
+        
+        // Если что-то пошло не так, возвращаем случайный хост
+        return hosts.get(0);
+    }
+    
+    // Стратегия случайного выбора
+    private String randomStrategy() {
+        List<String> hosts = new ArrayList<>(hostsStats.keySet());
+        int randomIndex = (int) (Math.random() * hosts.size());
+        return hosts.get(randomIndex);
+    }
+    
+    // Получение статистики по хостам
+    public Map<String, Map<String, Object>> getHostsStatistics() {
+        hostsLock.readLock().lock();
+        try {
+            Map<String, Map<String, Object>> result = new HashMap<>();
+            
+            for (Map.Entry<String, HostStats> entry : hostsStats.entrySet()) {
+                HostStats stats = entry.getValue();
+                Map<String, Object> hostStats = new HashMap<>();
+                
+                hostStats.put("activeConnections", stats.getActiveConnections());
+                hostStats.put("requestCount", stats.getRequestCount());
+                hostStats.put("averageResponseTime", stats.getAverageResponseTime());
+                
+                result.put(entry.getKey(), hostStats);
+            }
+            
+            return result;
+        } finally {
+            hostsLock.readLock().unlock();
+        }
+    }
+}
+```
+
+Хотите, чтобы я объяснил или разобрал этот код?
+
 Обновляю реализацию с учетом высокой нагрузки и временного окна в 5 минут:
 
 ```java
