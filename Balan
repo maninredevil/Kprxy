@@ -1,3 +1,120 @@
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.stream.Collectors;
+
+public class UltraFastAdaptiveLoadBalancer {
+
+    private static final int MAX_SAMPLES = 500;
+    private static final long MAX_WINDOW_MS = 5 * 60 * 1000;
+
+    // ===== Внутренний класс: кольцевой буфер задержек с таймштампами =====
+    private static class RingBuffer {
+        private final long[] times = new long[MAX_SAMPLES];
+        private final long[] timestamps = new long[MAX_SAMPLES];
+        private final AtomicInteger index = new AtomicInteger(0);
+
+        void add(long responseTimeMs) {
+            int i = Math.floorMod(index.getAndIncrement(), MAX_SAMPLES);
+            times[i] = responseTimeMs;
+            timestamps[i] = System.currentTimeMillis();
+        }
+
+        double getAverage() {
+            long now = System.currentTimeMillis();
+            long sum = 0;
+            int count = 0;
+
+            for (int i = 0; i < MAX_SAMPLES; i++) {
+                if (now - timestamps[i] <= MAX_WINDOW_MS) {
+                    sum += times[i];
+                    count++;
+                }
+            }
+
+            return count == 0 ? Double.MAX_VALUE : (double) sum / count;
+        }
+    }
+
+    // ===== Объект хоста =====
+    private static class HostEntry {
+        final String host;
+        final RingBuffer stats = new RingBuffer();
+
+        HostEntry(String host) {
+            this.host = host;
+        }
+    }
+
+    // ===== Хранилище хостов =====
+    private final ConcurrentHashMap<String, HostEntry> hostMap = new ConcurrentHashMap<>();
+    private final AtomicReference<HostEntry[]> liveHosts = new AtomicReference<>(new HostEntry[0]);
+
+    // ===== Конструктор =====
+    public UltraFastAdaptiveLoadBalancer(List<String> initialHosts) {
+        for (String h : initialHosts) {
+            hostMap.put(h, new HostEntry(h));
+        }
+        refreshHostArray();
+    }
+
+    // ===== Добавление / удаление =====
+    public void addHost(String host) {
+        hostMap.computeIfAbsent(host, HostEntry::new);
+        refreshHostArray();
+    }
+
+    public void removeHost(String host) {
+        hostMap.remove(host);
+        refreshHostArray();
+    }
+
+    private void refreshHostArray() {
+        HostEntry[] snapshot = hostMap.values().toArray(new HostEntry[0]);
+        liveHosts.set(snapshot);
+    }
+
+    // ===== Отчет о задержке =====
+    public void reportResponseTime(String host, long responseTimeMs) {
+        HostEntry entry = hostMap.get(host);
+        if (entry != null) {
+            entry.stats.add(responseTimeMs);
+        }
+    }
+
+    // ===== Балансировка =====
+    public String getHost() {
+        HostEntry[] snapshot = liveHosts.get();
+        if (snapshot.length == 0) {
+            throw new IllegalStateException("No available hosts");
+        }
+
+        HostEntry best = null;
+        double bestScore = Double.MAX_VALUE;
+
+        for (HostEntry h : snapshot) {
+            double avg = h.stats.getAverage();
+            if (avg < bestScore) {
+                bestScore = avg;
+                best = h;
+            }
+        }
+
+        return best.host;
+    }
+
+    // ===== Диагностика =====
+    public Map<String, Double> getAverages() {
+        return Arrays.stream(liveHosts.get())
+                .collect(Collectors.toMap(
+                        h -> h.host,
+                        h -> h.stats.getAverage()
+                ));
+    }
+}
+
+
+
 import org.junit.jupiter.api.Test;
 import java.util.*;
 import java.util.concurrent.*;
