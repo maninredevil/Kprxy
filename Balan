@@ -1,3 +1,66 @@
+import org.junit.jupiter.api.Test;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class UltraFastAdaptiveLoadBalancerJUnitTest {
+
+    @Test
+    void testLoadBalancingUnderSimulatedLatency() throws InterruptedException {
+        List<String> hosts = List.of("host-A", "host-B", "host-C");
+        UltraFastAdaptiveLoadBalancer balancer = new UltraFastAdaptiveLoadBalancer(hosts);
+
+        Map<String, Long> baseLatencies = Map.of(
+                "host-A", 100L,
+                "host-B", 200L,
+                "host-C", 400L
+        );
+
+        Map<String, AtomicInteger> selectionCount = new ConcurrentHashMap<>();
+        hosts.forEach(h -> selectionCount.put(h, new AtomicInteger()));
+
+        ExecutorService executor = Executors.newFixedThreadPool(16);
+        int totalRequests = 20_000;
+
+        CountDownLatch latch = new CountDownLatch(totalRequests);
+
+        for (int i = 0; i < totalRequests; i++) {
+            executor.submit(() -> {
+                String host = balancer.getHost();
+                long simulated = baseLatencies.get(host) + ThreadLocalRandom.current().nextInt(-20, 21);
+                simulated = Math.max(1, simulated);
+
+                balancer.reportResponseTime(host, simulated);
+                selectionCount.get(host).incrementAndGet();
+                latch.countDown();
+            });
+        }
+
+        latch.await(10, TimeUnit.SECONDS);
+        executor.shutdown();
+
+        System.out.println("=== Статистика выбора ===");
+        selectionCount.forEach((host, count) -> System.out.printf("%s: %d\n", host, count.get()));
+
+        System.out.println("\n=== Средняя задержка, по мнению балансировщика ===");
+        hosts.forEach(host -> {
+            double avg = balancer.hosts.get(host).stats.getAverage();
+            System.out.printf("%s: %.2f ms\n", host, avg);
+        });
+
+        System.out.println("\n=== Проверка, что 'host-A' выбран чаще остальных ===");
+        int a = selectionCount.get("host-A").get();
+        int b = selectionCount.get("host-B").get();
+        int c = selectionCount.get("host-C").get();
+
+        assertTrue(a > b, "host-A должен быть выбран чаще host-B");
+        assertTrue(b > c, "host-B должен быть выбран чаще host-C");
+    }
+}
+
+
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
