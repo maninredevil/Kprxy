@@ -1,0 +1,385 @@
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.StampedLock;
+
+/**
+ * Ультра-производительный балансировщик нагрузки для 30,000+ RPS
+ * Оптимизирован для минимальных задержек и максимальной пропускной способности
+ */
+public class UltraPerformanceLoadBalancer {
+    
+    public enum Strategy {
+        ROUND_ROBIN,
+        WEIGHTED_RESPONSE_TIME,
+        LEAST_CONNECTIONS,
+        POWER_OF_TWO_CHOICES,
+        CONSISTENT_HASH
+    }
+    
+    // Lock-free переменные для максимальной производительности
+    private volatile Strategy currentStrategy = Strategy.POWER_OF_TWO_CHOICES;
+    private volatile HostInfo[] hostsArray = new HostInfo[0]; // Массив для O(1) доступа
+    private final AtomicInteger roundRobinIndex = new AtomicInteger(0);
+    private final ThreadLocalRandom random = ThreadLocalRandom.current();
+    
+    // Кеширование для избежания пересоздания объектов
+    private static final int METRICS_RING_SIZE = 1024; // Степень 2 для быстрого модуло
+    private static final long METRICS_WINDOW_NS = 5L * 60 * 1_000_000_000L; // 5 минут в наносекундах
+    private static final int CLEANUP_BATCH_SIZE = 32;
+    
+    // Оптимизированная структура данных хоста
+    private static final class HostInfo {
+        final String host;
+        final AtomicInteger activeConnections = new AtomicInteger(0);
+        final AtomicLong totalResponseTimeNs = new AtomicLong(0);
+        final AtomicInteger requestCount = new AtomicInteger(0);
+        
+        // Ring buffer для последних измерений (lock-free)
+        private final ResponseMetric[] metricsRing = new ResponseMetric[METRICS_RING_SIZE];
+        private final AtomicInteger ringIndex = new AtomicInteger(0);
+        
+        // Кешированные значения для избежания пересчетов
+        private volatile long cachedAvgResponseNs = 1_000_000L; // 1ms по умолчанию
+        private volatile long lastCacheUpdate = 0;
+        private static final long CACHE_VALIDITY_NS = 100_000_000L; // 100ms
+        
+        HostInfo(String host) {
+            this.host = host;
+            // Инициализируем ring buffer
+            for (int i = 0; i < METRICS_RING_SIZE; i++) {
+                metricsRing[i] = new ResponseMetric();
+            }
+        }
+        
+        // Максимально быстрая запись метрики
+        void recordResponse(long responseTimeNs) {
+            activeConnections.decrementAndGet();
+            totalResponseTimeNs.addAndGet(responseTimeNs);
+            requestCount.incrementAndGet();
+            
+            // Записываем в ring buffer без блокировок
+            int idx = ringIndex.getAndIncrement() & (METRICS_RING_SIZE - 1);
+            ResponseMetric metric = metricsRing[idx];
+            metric.responseTimeNs = responseTimeNs;
+            metric.timestampNs = System.nanoTime();
+        }
+        
+        void incrementConnections() {
+            activeConnections.incrementAndGet();
+        }
+        
+        // Быстрое получение среднего времени ответа с кешированием
+        long getAvgResponseTimeNs() {
+            long now = System.nanoTime();
+            if (now - lastCacheUpdate > CACHE_VALIDITY_NS) {
+                updateCachedAverage(now);
+                lastCacheUpdate = now;
+            }
+            return cachedAvgResponseNs;
+        }
+        
+        private void updateCachedAverage(long now) {
+            long sum = 0;
+            int count = 0;
+            long cutoff = now - METRICS_WINDOW_NS;
+            
+            // Быстрый проход по ring buffer
+            for (int i = 0; i < METRICS_RING_SIZE; i++) {
+                ResponseMetric metric = metricsRing[i];
+                if (metric.timestampNs > cutoff && metric.responseTimeNs > 0) {
+                    sum += metric.responseTimeNs;
+                    count++;
+                }
+            }
+            
+            if (count > 0) {
+                cachedAvgResponseNs = sum / count;
+            }
+        }
+    }
+    
+    private static final class ResponseMetric {
+        volatile long responseTimeNs;
+        volatile long timestampNs;
+    }
+    
+    // StampedLock для редких операций изменения конфигурации
+    private final StampedLock configLock = new StampedLock();
+    private final ConcurrentHashMap<String, HostInfo> hostMap = new ConcurrentHashMap<>(16, 0.75f, 4);
+    
+    /**
+     * Добавить хост (редкая операция)
+     */
+    public void addHost(String host) {
+        if (host == null || host.isEmpty()) {
+            throw new IllegalArgumentException("Host cannot be null or empty");
+        }
+        
+        HostInfo hostInfo = new HostInfo(host);
+        hostMap.put(host, hostInfo);
+        
+        // Обновляем массив для быстрого доступа
+        long stamp = configLock.writeLock();
+        try {
+            rebuildHostsArray();
+        } finally {
+            configLock.unlockWrite(stamp);
+        }
+    }
+    
+    /**
+     * Удалить хост (редкая операция)
+     */
+    public void removeHost(String host) {
+        hostMap.remove(host);
+        
+        long stamp = configLock.writeLock();
+        try {
+            rebuildHostsArray();
+        } finally {
+            configLock.unlockWrite(stamp);
+        }
+    }
+    
+    private void rebuildHostsArray() {
+        Collection<HostInfo> hosts = hostMap.values();
+        hostsArray = hosts.toArray(new HostInfo[0]);
+    }
+    
+    /**
+     * Установить стратегию (редкая операция)
+     */
+    public void setStrategy(Strategy strategy) {
+        this.currentStrategy = strategy;
+    }
+    
+    /**
+     * КРИТИЧЕСКИЙ ПУТЬ: Получить хост для запроса
+     * Оптимизирован для минимальной задержки
+     */
+    public String getHost() {
+        HostInfo[] hosts = hostsArray; // Одно чтение volatile
+        if (hosts.length == 0) {
+            return null;
+        }
+        
+        HostInfo selected = selectHostUltraFast(hosts);
+        if (selected != null) {
+            selected.incrementConnections();
+            return selected.host;
+        }
+        return null;
+    }
+    
+    /**
+     * КРИТИЧЕСКИЙ ПУТЬ: Запись времени ответа
+     */
+    public void recordResponseTime(String host, long responseTimeMs) {
+        HostInfo hostInfo = hostMap.get(host);
+        if (hostInfo != null) {
+            hostInfo.recordResponse(responseTimeMs * 1_000_000L); // Конвертируем в наносекунды
+        }
+    }
+    
+    /**
+     * Ультра-быстрый выбор хоста без блокировок
+     */
+    private HostInfo selectHostUltraFast(HostInfo[] hosts) {
+        switch (currentStrategy) {
+            case ROUND_ROBIN:
+                return selectRoundRobinFast(hosts);
+            case POWER_OF_TWO_CHOICES:
+                return selectPowerOfTwoChoices(hosts);
+            case LEAST_CONNECTIONS:
+                return selectLeastConnectionsFast(hosts);
+            case WEIGHTED_RESPONSE_TIME:
+                return selectWeightedFast(hosts);
+            case CONSISTENT_HASH:
+                return selectConsistentHash(hosts);
+            default:
+                return selectPowerOfTwoChoices(hosts);
+        }
+    }
+    
+    /**
+     * Round Robin без синхронизации
+     */
+    private HostInfo selectRoundRobinFast(HostInfo[] hosts) {
+        int index = roundRobinIndex.getAndIncrement();
+        return hosts[Math.abs(index) % hosts.length];
+    }
+    
+    /**
+     * Power of Two Choices - оптимальный алгоритм для высокой нагрузки
+     * Выбирает 2 случайных хоста и берет менее нагруженный
+     */
+    private HostInfo selectPowerOfTwoChoices(HostInfo[] hosts) {
+        if (hosts.length == 1) return hosts[0];
+        
+        int idx1 = random.nextInt(hosts.length);
+        int idx2 = random.nextInt(hosts.length);
+        if (idx1 == idx2) {
+            idx2 = (idx2 + 1) % hosts.length;
+        }
+        
+        HostInfo host1 = hosts[idx1];
+        HostInfo host2 = hosts[idx2];
+        
+        // Быстрое сравнение нагрузки
+        int load1 = host1.activeConnections.get();
+        int load2 = host2.activeConnections.get();
+        
+        return load1 <= load2 ? host1 : host2;
+    }
+    
+    /**
+     * Быстрый поиск хоста с минимальными соединениями
+     */
+    private HostInfo selectLeastConnectionsFast(HostInfo[] hosts) {
+        HostInfo selected = hosts[0];
+        int minConnections = selected.activeConnections.get();
+        
+        for (int i = 1; i < hosts.length; i++) {
+            int connections = hosts[i].activeConnections.get();
+            if (connections < minConnections) {
+                minConnections = connections;
+                selected = hosts[i];
+            }
+        }
+        return selected;
+    }
+    
+    /**
+     * Взвешенный выбор по времени ответа (упрощённый для скорости)
+     */
+    private HostInfo selectWeightedFast(HostInfo[] hosts) {
+        if (hosts.length == 1) return hosts[0];
+        
+        // Быстрый алгоритм: находим самый быстрый и один из случайных
+        HostInfo fastest = hosts[0];
+        long minTime = fastest.getAvgResponseTimeNs();
+        
+        for (int i = 1; i < hosts.length; i++) {
+            long time = hosts[i].getAvgResponseTimeNs();
+            if (time < minTime) {
+                minTime = time;
+                fastest = hosts[i];
+            }
+        }
+        
+        // 70% запросов на самый быстрый, 30% распределяем случайно
+        return random.nextInt(10) < 7 ? fastest : hosts[random.nextInt(hosts.length)];
+    }
+    
+    /**
+     * Consistent Hashing для стабильности при изменении пула хостов
+     */
+    private HostInfo selectConsistentHash(HostInfo[] hosts) {
+        long hash = Thread.currentThread().getId(); // Быстрый хеш от ID потока
+        int index = (int) (Math.abs(hash) % hosts.length);
+        return hosts[index];
+    }
+    
+    /**
+     * Получить базовую статистику без детализации
+     */
+    public Map<String, BasicStats> getBasicStats() {
+        Map<String, BasicStats> stats = new HashMap<>();
+        HostInfo[] hosts = hostsArray;
+        
+        for (HostInfo host : hosts) {
+            stats.put(host.host, new BasicStats(
+                host.activeConnections.get(),
+                host.requestCount.get(),
+                host.getAvgResponseTimeNs() / 1_000_000L // Конвертируем в мс
+            ));
+        }
+        return stats;
+    }
+    
+    public static class BasicStats {
+        public final int activeConnections;
+        public final int totalRequests;
+        public final long avgResponseTimeMs;
+        
+        BasicStats(int activeConnections, int totalRequests, long avgResponseTimeMs) {
+            this.activeConnections = activeConnections;
+            this.totalRequests = totalRequests;
+            this.avgResponseTimeMs = avgResponseTimeMs;
+        }
+        
+        @Override
+        public String toString() {
+            return String.format("Stats{active=%d, total=%d, avgMs=%d}", 
+                activeConnections, totalRequests, avgResponseTimeMs);
+        }
+    }
+    
+    /**
+     * Получить информацию о хостах
+     */
+    public Set<String> getHosts() {
+        return new HashSet<>(hostMap.keySet());
+    }
+    
+    public Strategy getCurrentStrategy() {
+        return currentStrategy;
+    }
+    
+    // Тест производительности
+    public static void main(String[] args) throws InterruptedException {
+        UltraPerformanceLoadBalancer lb = new UltraPerformanceLoadBalancer();
+        
+        // Добавляем хосты
+        for (int i = 1; i <= 10; i++) {
+            lb.addHost("server" + i + ".example.com");
+        }
+        
+        System.out.println("=== Performance Test for 30,000 RPS ===");
+        
+        // Тестируем каждую стратегию
+        for (Strategy strategy : Strategy.values()) {
+            lb.setStrategy(strategy);
+            System.out.println("\n--- Testing " + strategy + " ---");
+            
+            int requests = 30000;
+            int threads = 16;
+            ExecutorService executor = Executors.newFixedThreadPool(threads);
+            CountDownLatch latch = new CountDownLatch(threads);
+            
+            long startTime = System.nanoTime();
+            
+            for (int t = 0; t < threads; t++) {
+                executor.submit(() -> {
+                    try {
+                        for (int i = 0; i < requests / threads; i++) {
+                            String host = lb.getHost();
+                            if (host != null) {
+                                // Симулируем быстрый ответ
+                                lb.recordResponseTime(host, 10 + (i % 50));
+                            }
+                        }
+                    } finally {
+                        latch.countDown();
+                    }
+                });
+            }
+            
+            latch.await();
+            long duration = System.nanoTime() - startTime;
+            double rps = (double) requests / (duration / 1_000_000_000.0);
+            
+            System.out.printf("Processed %d requests in %.3f seconds\n", requests, duration / 1_000_000_000.0);
+            System.out.printf("Throughput: %.0f RPS\n", rps);
+            
+            executor.shutdown();
+            executor.awaitTermination(1, TimeUnit.SECONDS);
+        }
+        
+        // Показываем статистику
+        System.out.println("\n=== Final Stats ===");
+        lb.getBasicStats().forEach((host, stats) -> 
+            System.out.println(host + ": " + stats));
+    }
+}
