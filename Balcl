@@ -1,0 +1,93 @@
+java
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class LoadBalancer {
+    private final List<String> hosts;
+    private final Map<String, HostStats> hostStats;
+    
+    private static class HostStats {
+        private double avgResponseTime;
+        private int requestCount;
+        
+        public HostStats() {
+            this.avgResponseTime = 0;
+            this.requestCount = 0;
+        }
+        
+        public void updateStats(long responseTime) {
+            avgResponseTime = (avgResponseTime * requestCount + responseTime) / (requestCount + 1);
+            requestCount++;
+        }
+    }
+    
+    public LoadBalancer(List<String> hosts) {
+        this.hosts = new ArrayList<>(hosts);
+        this.hostStats = new ConcurrentHashMap<>();
+        
+        for (String host : hosts) {
+            hostStats.put(host, new HostStats());
+        }
+    }
+    
+    public String getNextHost() {
+        String selectedHost = null;
+        double minScore = Double.MAX_VALUE;
+        
+        for (String host : hosts) {
+            HostStats stats = hostStats.get(host);
+            // Вычисляем score на основе среднего времени ответа и количества запросов
+            double score = stats.avgResponseTime * (stats.requestCount + 1);
+            
+            if (score < minScore) {
+                minScore = score;
+                selectedHost = host;
+            }
+        }
+        
+        return selectedHost;
+    }
+    
+    public void reportResponseTime(String host, long responseTimeMs) {
+        HostStats stats = hostStats.get(host);
+        if (stats != null) {
+            stats.updateStats(responseTimeMs);
+        }
+    }
+    
+    public Map<String, Double> getHostsStats() {
+        Map<String, Double> stats = new HashMap<>();
+        for (Map.Entry<String, HostStats> entry : hostStats.entrySet()) {
+            stats.put(entry.getKey(), entry.getValue().avgResponseTime);
+        }
+        return stats;
+    }
+}
+```
+
+Пример использования:
+
+```java
+public class Main {
+    public static void main(String[] args) {
+        // Инициализация балансировщика
+        List<String> hosts = Arrays.asList(
+            "server1.example.com",
+            "server2.example.com",
+            "server3.example.com"
+        );
+        
+        LoadBalancer balancer = new LoadBalancer(hosts);
+        
+        // Получение хоста и отправка статистики
+        String host = balancer.getNextHost();
+        System.out.println("Selected host: " + host);
+        
+        // Имитация запроса и отправка времени ответа
+        balancer.reportResponseTime(host, 150); // 150ms response time
+        
+        // Получение статистики
+        Map<String, Double> stats = balancer.getHostsStats();
+        System.out.println("Current stats: " + stats);
+    }
+}
