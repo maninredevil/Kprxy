@@ -1,3 +1,435 @@
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+/**
+ * Высокопроизводительный балансировщик нагрузки с поддержкой различных стратегий
+ * Рассчитан на обработку до 30,000 RPS
+ */
+public class LoadBalancer {
+    
+    public enum Strategy {
+        ROUND_ROBIN,
+        WEIGHTED_RESPONSE_TIME,
+        LEAST_CONNECTIONS,
+        ADAPTIVE_WEIGHTED,
+        RANDOM_WEIGHTED
+    }
+    
+    private volatile Strategy currentStrategy = Strategy.WEIGHTED_RESPONSE_TIME;
+    private final ConcurrentHashMap<String, HostMetrics> hosts = new ConcurrentHashMap<>();
+    private final AtomicInteger roundRobinCounter = new AtomicInteger(0);
+    private final Random random = new Random();
+    private final ScheduledExecutorService cleanupExecutor = Executors.newSingleThreadScheduledExecutor();
+    
+    // Настройки для высокой производительности
+    private static final int METRICS_WINDOW_MINUTES = 5;
+    private static final int CLEANUP_INTERVAL_SECONDS = 30;
+    private static final int MIN_WEIGHT = 1;
+    private static final int MAX_WEIGHT = 100;
+    private static final double SMOOTHING_FACTOR = 0.1; // Для плавной балансировки
+    
+    public LoadBalancer() {
+        // Периодическая очистка старых метрик
+        cleanupExecutor.scheduleAtFixedRate(
+            this::cleanupOldMetrics, 
+            CLEANUP_INTERVAL_SECONDS, 
+            CLEANUP_INTERVAL_SECONDS, 
+            TimeUnit.SECONDS
+        );
+    }
+    
+    /**
+     * Метрики хоста с оптимизацией для высокой нагрузки
+     */
+    private static class HostMetrics {
+        private final String host;
+        private final AtomicLong totalResponseTime = new AtomicLong(0);
+        private final AtomicInteger requestCount = new AtomicInteger(0);
+        private final AtomicInteger activeConnections = new AtomicInteger(0);
+        private final ConcurrentLinkedQueue<ResponseTimeEntry> recentResponses = new ConcurrentLinkedQueue<>();
+        private volatile double averageResponseTime = 0.0;
+        private volatile int weight = 50; // Динамический вес
+        
+        public HostMetrics(String host) {
+            this.host = host;
+        }
+        
+        public void recordResponseTime(long responseTimeMs) {
+            long now = System.currentTimeMillis();
+            recentResponses.offer(new ResponseTimeEntry(responseTimeMs, now));
+            totalResponseTime.addAndGet(responseTimeMs);
+            requestCount.incrementAndGet();
+            activeConnections.decrementAndGet();
+            
+            // Обновляем средний показатель (простой расчет для производительности)
+            updateAverageResponseTime();
+        }
+        
+        public void incrementConnections() {
+            activeConnections.incrementAndGet();
+        }
+        
+        private void updateAverageResponseTime() {
+            int count = requestCount.get();
+            if (count > 0) {
+                averageResponseTime = (double) totalResponseTime.get() / count;
+            }
+        }
+        
+        public void cleanup() {
+            long cutoff = System.currentTimeMillis() - TimeUnit.MINUTES.toMillis(METRICS_WINDOW_MINUTES);
+            ResponseTimeEntry entry;
+            while ((entry = recentResponses.peek()) != null && entry.timestamp < cutoff) {
+                recentResponses.poll();
+            }
+        }
+        
+        public double getRecentAverageResponseTime() {
+            List<ResponseTimeEntry> recent = new ArrayList<>();
+            long cutoff = System.currentTimeMillis() - TimeUnit.MINUTES.toMillis(METRICS_WINDOW_MINUTES);
+            
+            for (ResponseTimeEntry entry : recentResponses) {
+                if (entry.timestamp >= cutoff) {
+                    recent.add(entry);
+                }
+            }
+            
+            if (recent.isEmpty()) {
+                return averageResponseTime;
+            }
+            
+            return recent.stream()
+                    .mapToLong(e -> e.responseTime)
+                    .average()
+                    .orElse(averageResponseTime);
+        }
+        
+        private static class ResponseTimeEntry {
+            final long responseTime;
+            final long timestamp;
+            
+            ResponseTimeEntry(long responseTime, long timestamp) {
+                this.responseTime = responseTime;
+                this.timestamp = timestamp;
+            }
+        }
+    }
+    
+    /**
+     * Добавить хост в пул балансировки
+     */
+    public void addHost(String host) {
+        if (host == null || host.trim().isEmpty()) {
+            throw new IllegalArgumentException("Host cannot be null or empty");
+        }
+        hosts.put(host, new HostMetrics(host));
+    }
+    
+    /**
+     * Удалить хост из пула балансировки
+     */
+    public void removeHost(String host) {
+        hosts.remove(host);
+    }
+    
+    /**
+     * Получить список всех хостов
+     */
+    public Set<String> getHosts() {
+        return new HashSet<>(hosts.keySet());
+    }
+    
+    /**
+     * Установить стратегию балансировки
+     */
+    public void setStrategy(Strategy strategy) {
+        this.currentStrategy = strategy;
+    }
+    
+    /**
+     * Получить текущую стратегию
+     */
+    public Strategy getCurrentStrategy() {
+        return currentStrategy;
+    }
+    
+    /**
+     * Получить хост для обработки запроса
+     */
+    public String getHost() {
+        if (hosts.isEmpty()) {
+            throw new IllegalStateException("No hosts available");
+        }
+        
+        String selectedHost = selectHostByStrategy();
+        if (selectedHost != null) {
+            HostMetrics metrics = hosts.get(selectedHost);
+            if (metrics != null) {
+                metrics.incrementConnections();
+            }
+        }
+        return selectedHost;
+    }
+    
+    /**
+     * Записать время ответа для хоста
+     */
+    public void recordResponseTime(String host, long responseTimeMs) {
+        HostMetrics metrics = hosts.get(host);
+        if (metrics != null) {
+            metrics.recordResponseTime(responseTimeMs);
+            updateHostWeight(metrics);
+        }
+    }
+    
+    /**
+     * Выбор хоста в зависимости от стратегии
+     */
+    private String selectHostByStrategy() {
+        switch (currentStrategy) {
+            case ROUND_ROBIN:
+                return selectRoundRobin();
+            case WEIGHTED_RESPONSE_TIME:
+                return selectWeightedByResponseTime();
+            case LEAST_CONNECTIONS:
+                return selectLeastConnections();
+            case ADAPTIVE_WEIGHTED:
+                return selectAdaptiveWeighted();
+            case RANDOM_WEIGHTED:
+                return selectRandomWeighted();
+            default:
+                return selectWeightedByResponseTime();
+        }
+    }
+    
+    /**
+     * Round Robin стратегия
+     */
+    private String selectRoundRobin() {
+        List<String> hostList = new ArrayList<>(hosts.keySet());
+        if (hostList.isEmpty()) return null;
+        
+        int index = Math.abs(roundRobinCounter.getAndIncrement()) % hostList.size();
+        return hostList.get(index);
+    }
+    
+    /**
+     * Взвешенная балансировка по времени ответа
+     */
+    private String selectWeightedByResponseTime() {
+        List<Map.Entry<String, HostMetrics>> hostList = new ArrayList<>(hosts.entrySet());
+        if (hostList.isEmpty()) return null;
+        
+        // Рассчитываем обратные веса (меньше время ответа = больше вес)
+        double totalInverseWeight = 0;
+        Map<String, Double> weights = new HashMap<>();
+        
+        for (Map.Entry<String, HostMetrics> entry : hostList) {
+            double avgTime = entry.getValue().getRecentAverageResponseTime();
+            if (avgTime <= 0) avgTime = 1; // Защита от деления на ноль
+            
+            double inverseWeight = 1000.0 / avgTime; // Обратный вес
+            weights.put(entry.getKey(), inverseWeight);
+            totalInverseWeight += inverseWeight;
+        }
+        
+        double randomValue = random.nextDouble() * totalInverseWeight;
+        double currentWeight = 0;
+        
+        for (Map.Entry<String, Double> entry : weights.entrySet()) {
+            currentWeight += entry.getValue();
+            if (randomValue <= currentWeight) {
+                return entry.getKey();
+            }
+        }
+        
+        return hostList.get(0).getKey(); // Fallback
+    }
+    
+    /**
+     * Наименьшее количество активных соединений
+     */
+    private String selectLeastConnections() {
+        return hosts.entrySet().stream()
+                .min(Comparator.comparing(entry -> entry.getValue().activeConnections.get()))
+                .map(Map.Entry::getKey)
+                .orElse(null);
+    }
+    
+    /**
+     * Адаптивная взвешенная балансировка
+     */
+    private String selectAdaptiveWeighted() {
+        List<Map.Entry<String, HostMetrics>> hostList = new ArrayList<>(hosts.entrySet());
+        if (hostList.isEmpty()) return null;
+        
+        double totalWeight = hostList.stream()
+                .mapToDouble(entry -> entry.getValue().weight)
+                .sum();
+        
+        double randomValue = random.nextDouble() * totalWeight;
+        double currentWeight = 0;
+        
+        for (Map.Entry<String, HostMetrics> entry : hostList) {
+            currentWeight += entry.getValue().weight;
+            if (randomValue <= currentWeight) {
+                return entry.getKey();
+            }
+        }
+        
+        return hostList.get(0).getKey(); // Fallback
+    }
+    
+    /**
+     * Случайная взвешенная балансировка
+     */
+    private String selectRandomWeighted() {
+        List<String> weightedHosts = new ArrayList<>();
+        
+        for (Map.Entry<String, HostMetrics> entry : hosts.entrySet()) {
+            int weight = entry.getValue().weight;
+            for (int i = 0; i < weight; i++) {
+                weightedHosts.add(entry.getKey());
+            }
+        }
+        
+        if (weightedHosts.isEmpty()) return null;
+        return weightedHosts.get(random.nextInt(weightedHosts.size()));
+    }
+    
+    /**
+     * Обновление веса хоста на основе производительности
+     */
+    private void updateHostWeight(HostMetrics metrics) {
+        double avgResponseTime = metrics.getRecentAverageResponseTime();
+        
+        if (avgResponseTime > 0) {
+            // Плавное обновление веса
+            double targetWeight = Math.max(MIN_WEIGHT, Math.min(MAX_WEIGHT, 1000.0 / avgResponseTime));
+            double newWeight = metrics.weight * (1 - SMOOTHING_FACTOR) + targetWeight * SMOOTHING_FACTOR;
+            metrics.weight = (int) Math.round(newWeight);
+        }
+    }
+    
+    /**
+     * Очистка старых метрик
+     */
+    private void cleanupOldMetrics() {
+        hosts.values().forEach(HostMetrics::cleanup);
+    }
+    
+    /**
+     * Получить статистику по хостам
+     */
+    public Map<String, HostStats> getHostStatistics() {
+        Map<String, HostStats> stats = new HashMap<>();
+        
+        for (Map.Entry<String, HostMetrics> entry : hosts.entrySet()) {
+            HostMetrics metrics = entry.getValue();
+            stats.put(entry.getKey(), new HostStats(
+                metrics.getRecentAverageResponseTime(),
+                metrics.activeConnections.get(),
+                metrics.requestCount.get(),
+                metrics.weight
+            ));
+        }
+        
+        return stats;
+    }
+    
+    /**
+     * Статистика хоста
+     */
+    public static class HostStats {
+        public final double averageResponseTime;
+        public final int activeConnections;
+        public final int totalRequests;
+        public final int weight;
+        
+        public HostStats(double averageResponseTime, int activeConnections, int totalRequests, int weight) {
+            this.averageResponseTime = averageResponseTime;
+            this.activeConnections = activeConnections;
+            this.totalRequests = totalRequests;
+            this.weight = weight;
+        }
+        
+        @Override
+        public String toString() {
+            return String.format("HostStats{avgTime=%.2fms, activeConn=%d, totalReq=%d, weight=%d}", 
+                averageResponseTime, activeConnections, totalRequests, weight);
+        }
+    }
+    
+    /**
+     * Закрытие ресурсов
+     */
+    public void shutdown() {
+        cleanupExecutor.shutdown();
+        try {
+            if (!cleanupExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                cleanupExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            cleanupExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+    
+    // Пример использования и тестирования
+    public static void main(String[] args) throws InterruptedException {
+        LoadBalancer lb = new LoadBalancer();
+        
+        // Добавляем хосты
+        lb.addHost("server1.example.com");
+        lb.addHost("server2.example.com");
+        lb.addHost("server3.example.com");
+        
+        // Тестируем разные стратегии
+        System.out.println("=== Testing Load Balancer ===");
+        
+        // Симулируем нагрузку
+        for (int i = 0; i < 100; i++) {
+            String host = lb.getHost();
+            // Симулируем разное время ответа
+            long responseTime = 50 + random.nextInt(200);
+            if (host.contains("server1")) responseTime += 100; // server1 медленнее
+            
+            lb.recordResponseTime(host, responseTime);
+            
+            if (i % 20 == 0) {
+                System.out.println("\nIteration " + i + ", Strategy: " + lb.getCurrentStrategy());
+                lb.getHostStatistics().forEach((h, stats) -> 
+                    System.out.println(h + ": " + stats));
+            }
+        }
+        
+        // Тестируем разные стратегии
+        for (Strategy strategy : Strategy.values()) {
+            lb.setStrategy(strategy);
+            System.out.println("\n=== Testing " + strategy + " ===");
+            
+            Map<String, Integer> distribution = new HashMap<>();
+            for (int i = 0; i < 100; i++) {
+                String host = lb.getHost();
+                distribution.merge(host, 1, Integer::sum);
+                lb.recordResponseTime(host, 50 + random.nextInt(100));
+            }
+            
+            distribution.forEach((host, count) -> 
+                System.out.println(host + ": " + count + " requests"));
+        }
+        
+        lb.shutdown();
+    }
+}
+
+
+
+
+
 Вот максимально оптимизированная версия балансировщика, специально разработанная для минимального влияния на пропускную способность высоконагруженного сервиса с 30000+ запросов в секунду:
 
 ```java
