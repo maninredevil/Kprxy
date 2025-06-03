@@ -1,0 +1,169 @@
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class UltraFastAdaptiveLoadBalancer {
+
+    private static final int MAX_SAMPLES = 100;
+    private static final long MAX_WINDOW_MS = 5 * 60 * 1000;
+
+    private static class RingBuffer {
+        private final long[] times = new long[MAX_SAMPLES];
+        private final long[] timestamps = new long[MAX_SAMPLES];
+        private final AtomicInteger writeIndex = new AtomicInteger(0);
+
+        void add(long responseTimeMs) {
+            int i = writeIndex.getAndIncrement() % MAX_SAMPLES;
+            times[i] = responseTimeMs;
+            timestamps[i] = System.currentTimeMillis();
+        }
+
+        double getAverage() {
+            long now = System.currentTimeMillis();
+            long sum = 0;
+            int count = 0;
+
+            for (int i = 0; i < MAX_SAMPLES; i++) {
+                if (now - timestamps[i] <= MAX_WINDOW_MS) {
+                    sum += times[i];
+                    count++;
+                }
+            }
+
+            return count == 0 ? Double.MAX_VALUE : sum / (double) count;
+        }
+    }
+
+    private static class HostEntry {
+        final String host;
+        final RingBuffer stats = new RingBuffer();
+
+        HostEntry(String host) {
+            this.host = host;
+        }
+    }
+
+    private final ConcurrentHashMap<String, HostEntry> hosts = new ConcurrentHashMap<>();
+    private volatile HostEntry[] fastHostArray = new HostEntry[0];
+
+    public UltraFastAdaptiveLoadBalancer(List<String> initialHosts) {
+        for (String h : initialHosts) {
+            addHost(h);
+        }
+    }
+
+    public void addHost(String host) {
+        HostEntry entry = new HostEntry(host);
+        hosts.put(host, entry);
+        refreshFastArray();
+    }
+
+    public void removeHost(String host) {
+        hosts.remove(host);
+        refreshFastArray();
+    }
+
+    private void refreshFastArray() {
+        fastHostArray = hosts.values().toArray(new HostEntry[0]);
+    }
+
+    public void reportResponseTime(String host, long responseTimeMs) {
+        HostEntry entry = hosts.get(host);
+        if (entry != null) {
+            entry.stats.add(responseTimeMs);
+        }
+    }
+
+    public String getHost() {
+        HostEntry[] local = fastHostArray;
+
+        HostEntry best = null;
+        double bestScore = Double.MAX_VALUE;
+
+        for (HostEntry h : local) {
+            double avg = h.stats.getAverage();
+            if (avg < bestScore) {
+                bestScore = avg;
+                best = h;
+            }
+        }
+
+        if (best == null) throw new IllegalStateException("No available hosts");
+        return best.host;
+    }
+}
+
+
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class UltraFastAdaptiveLoadBalancerTest {
+
+    public static void main(String[] args) throws InterruptedException {
+        List<String> hosts = List.of("host-A", "host-B", "host-C");
+        UltraFastAdaptiveLoadBalancer balancer = new UltraFastAdaptiveLoadBalancer(hosts);
+
+        // Искусственно задаём "нагрузку" на хосты
+        Map<String, Long> simulatedBaseLatency = Map.of(
+                "host-A", 100L,
+                "host-B", 200L,
+                "host-C", 300L
+        );
+
+        AtomicInteger[] hitCounters = {
+            new AtomicInteger(0),
+            new AtomicInteger(0),
+            new AtomicInteger(0)
+        };
+
+        Map<String, AtomicInteger> hitMap = new HashMap<>();
+        for (String h : hosts) {
+            hitMap.put(h, new AtomicInteger());
+        }
+
+        // Пул для симуляции параллельных клиентов
+        ExecutorService executor = Executors.newFixedThreadPool(16);
+        int totalRequests = 10_000;
+
+        for (int i = 0; i < totalRequests; i++) {
+            executor.submit(() -> {
+                String host = balancer.getHost();
+                long base = simulatedBaseLatency.get(host);
+
+                // Добавляем случайную задержку ±20ms
+                long actual = base + ThreadLocalRandom.current().nextInt(-20, 21);
+                if (actual < 1) actual = 1;
+
+                balancer.reportResponseTime(host, actual);
+                hitMap.get(host).incrementAndGet();
+
+                // Эмуляция сетевой задержки
+                try {
+                    Thread.sleep(1);
+                } catch (InterruptedException ignored) {}
+            });
+        }
+
+        executor.shutdown();
+        executor.awaitTermination(10, TimeUnit.SECONDS);
+
+        System.out.println("=== Статистика выбора хостов ===");
+        for (String h : hosts) {
+            System.out.printf("%s: %d запросов\n", h, hitMap.get(h).get());
+        }
+
+        System.out.println("\n=== Среднее время отклика (по версии балансировщика) ===");
+        for (String h : hosts) {
+            System.out.printf("%s: %.2f мс\n", h,
+                    balancer.hosts.get(h).stats.getAverage());
+        }
+
+        System.out.println("\n=== Пример 10 выборок ===");
+        for (int i = 0; i < 10; i++) {
+            String h = balancer.getHost();
+            System.out.printf("[%d] -> %s\n", i + 1, h);
+        }
+    }
+}
