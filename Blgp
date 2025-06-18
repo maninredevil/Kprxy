@@ -1,0 +1,187 @@
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.*;
+import java.util.function.*;
+
+public class UltraLoadBalancer {
+
+    // Стратегии выбора хоста
+    public enum Strategy {
+        FASTEST_FIRST(UltraLoadBalancer::selectFastest),
+        LEAST_REQUESTS(UltraLoadBalancer::selectLeastRequests),
+        ROUND_ROBIN(UltraLoadBalancer::selectRoundRobin),
+        WEIGHTED_RANDOM(UltraLoadBalancer::selectWeightedRandom);
+
+        final BiFunction<Host[], UltraLoadBalancer, Host> selector;
+
+        Strategy(BiFunction<Host[], UltraLoadBalancer, Host> selector) {
+            this.selector = selector;
+        }
+    }
+
+    // Конфигурация балансировщика
+    public static final class Config {
+        final double ewmaAlpha;
+        final int topK;
+
+        public Config(double ewmaAlpha, int topK) {
+            if (ewmaAlpha <= 0 || ewmaAlpha > 1.0) throw new IllegalArgumentException("Invalid EWMA alpha");
+            if (topK <= 0) throw new IllegalArgumentException("topK must be > 0");
+            this.ewmaAlpha = ewmaAlpha;
+            this.topK = topK;
+        }
+    }
+
+    // Представление хоста
+    private static final class Host {
+        final String address;
+        final AtomicLong ewmaLatency = new AtomicLong(0); // EWMA latency in microseconds
+        final LongAdder totalRequests = new LongAdder();
+
+        Host(String address) {
+            this.address = address;
+        }
+
+        void record(long latencyMicros, double alpha) {
+            ewmaLatency.updateAndGet(prev -> prev == 0
+                    ? latencyMicros
+                    : (long)(alpha * latencyMicros + (1 - alpha) * prev));
+            totalRequests.increment();
+        }
+
+        long latency() { return ewmaLatency.get(); }
+        long requests() { return totalRequests.sum(); }
+        String addr() { return address; }
+    }
+
+    private final ConcurrentHashMap<String, Host> hosts = new ConcurrentHashMap<>();
+    private volatile Host[] snapshot = new Host[0];
+    private final Config config;
+    private final AtomicInteger rrIndex = new AtomicInteger();
+    private volatile Strategy strategy = Strategy.FASTEST_FIRST;
+
+    public UltraLoadBalancer(Config config) {
+        this.config = config;
+    }
+
+    // Регистрация хоста
+    public void registerHost(String address) {
+        if (hosts.putIfAbsent(address, new Host(address)) == null) {
+            refreshSnapshot();
+        }
+    }
+
+    // Удаление хоста
+    public void removeHost(String address) {
+        if (hosts.remove(address) != null) {
+            refreshSnapshot();
+        }
+    }
+
+    // Установка стратегии
+    public void setStrategy(Strategy strategy) {
+        this.strategy = strategy;
+    }
+
+    // Получение следующего хоста
+    public String getHost() {
+        Host[] list = snapshot;
+        if (list.length == 0) return null;
+        Host selected = strategy.selector.apply(list, this);
+        return selected != null ? selected.addr() : null;
+    }
+
+    // Запись времени ответа
+    public void recordResponse(String address, long latencyMicros) {
+        Host h = hosts.get(address);
+        if (h != null) {
+            h.record(latencyMicros, config.ewmaAlpha);
+        }
+    }
+
+    // Получение статистики
+    public List<String> getStats() {
+        List<String> out = new ArrayList<>();
+        for (Host h : snapshot) {
+            out.add(String.format("Host: %s | Latency: %dμs | Req: %d",
+                    h.addr(), h.latency(), h.requests()));
+        }
+        return out;
+    }
+
+    // Обновление снапшота для чтений
+    private void refreshSnapshot() {
+        snapshot = hosts.values().toArray(new Host[0]);
+    }
+
+    // ===== Реализация стратегий =====
+
+    private static Host selectFastest(Host[] hosts, UltraLoadBalancer balancer) {
+        if (hosts.length == 1) return hosts[0];
+        Arrays.sort(hosts, Comparator.comparingLong(Host::latency));
+        int limit = Math.min(balancer.config.topK, hosts.length);
+        return hosts[ThreadLocalRandom.current().nextInt(limit)];
+    }
+
+    private static Host selectLeastRequests(Host[] hosts, UltraLoadBalancer b) {
+        Host best = hosts[0];
+        long min = best.requests();
+        for (int i = 1; i < hosts.length; i++) {
+            long r = hosts[i].requests();
+            if (r < min) {
+                best = hosts[i];
+                min = r;
+            }
+        }
+        return best;
+    }
+
+    private static Host selectRoundRobin(Host[] hosts, UltraLoadBalancer b) {
+        int idx = Math.abs(b.rrIndex.getAndIncrement()) % hosts.length;
+        return hosts[idx];
+    }
+
+    private static Host selectWeightedRandom(Host[] hosts, UltraLoadBalancer b) {
+        double totalWeight = 0;
+        double[] weights = new double[hosts.length];
+
+        for (int i = 0; i < hosts.length; i++) {
+            long lat = hosts[i].latency();
+            double w = lat > 0 ? 1.0 / lat : 1.0;
+            weights[i] = w;
+            totalWeight += w;
+        }
+
+        double r = ThreadLocalRandom.current().nextDouble() * totalWeight;
+        double acc = 0;
+        for (int i = 0; i < weights.length; i++) {
+            acc += weights[i];
+            if (r <= acc) return hosts[i];
+        }
+
+        return hosts[hosts.length - 1];
+    }
+}
+
+
+public class Main {
+    public static void main(String[] args) {
+        UltraLoadBalancer lb = new UltraLoadBalancer(new UltraLoadBalancer.Config(0.15, 3));
+
+        lb.registerHost("10.0.0.1");
+        lb.registerHost("10.0.0.2");
+        lb.registerHost("10.0.0.3");
+
+        lb.setStrategy(UltraLoadBalancer.Strategy.FASTEST_FIRST);
+
+        for (int i = 0; i < 1_000_000; i++) {
+            String host = lb.getHost();
+            if (host != null) {
+                long latency = 10 + (long)(Math.random() * 100);
+                lb.recordResponse(host, latency);
+            }
+        }
+
+        lb.getStats().forEach(System.out::println);
+    }
+}
