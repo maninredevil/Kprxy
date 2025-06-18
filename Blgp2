@@ -1,0 +1,142 @@
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class LatencyBasedLoadBalancer {
+
+    // ================================ ENUM ================================
+    public enum Strategy {
+        LATENCY_AWARE,
+        ROUND_ROBIN,
+        RANDOM
+    }
+
+    // ============================== CONFIG ===============================
+    private static final long WINDOW_MILLIS = 5 * 60 * 1000;
+
+    // ============================ HOST STATS =============================
+    private static class ResponseRecord {
+        final long time;
+        final long timestamp;
+
+        ResponseRecord(long time, long timestamp) {
+            this.time = time;
+            this.timestamp = timestamp;
+        }
+    }
+
+    private static class HostStats {
+        final String host;
+        final ConcurrentLinkedDeque<ResponseRecord> responses = new ConcurrentLinkedDeque<>();
+
+        HostStats(String host) {
+            this.host = host;
+        }
+
+        void record(long responseTimeMillis) {
+            long now = System.currentTimeMillis();
+            responses.addLast(new ResponseRecord(responseTimeMillis, now));
+            cleanup(now);
+        }
+
+        void cleanup(long now) {
+            while (!responses.isEmpty() && now - responses.peekFirst().timestamp > WINDOW_MILLIS) {
+                responses.pollFirst();
+            }
+        }
+
+        double getAvgLatency() {
+            long now = System.currentTimeMillis();
+            cleanup(now);
+            long sum = 0;
+            int count = 0;
+
+            for (ResponseRecord r : responses) {
+                sum += r.time;
+                count++;
+            }
+
+            return count == 0 ? Double.MAX_VALUE : (double) sum / count;
+        }
+
+        int getSampleSize() {
+            return responses.size();
+        }
+    }
+
+    // ============================== FIELDS ===============================
+    private final ConcurrentHashMap<String, HostStats> hostMap = new ConcurrentHashMap<>();
+    private final CopyOnWriteArrayList<String> hostList = new CopyOnWriteArrayList<>();
+    private final AtomicInteger rrIndex = new AtomicInteger(0);
+    private volatile Strategy strategy = Strategy.LATENCY_AWARE;
+    private final ThreadLocalRandom rand = ThreadLocalRandom.current();
+
+    // ============================= METHODS ===============================
+    public void setStrategy(Strategy strategy) {
+        this.strategy = strategy;
+    }
+
+    public void addHost(String host) {
+        hostMap.putIfAbsent(host, new HostStats(host));
+        hostList.addIfAbsent(host);
+    }
+
+    public void removeHost(String host) {
+        hostMap.remove(host);
+        hostList.remove(host);
+    }
+
+    public void recordResponse(String host, long responseTimeMillis) {
+        HostStats stats = hostMap.get(host);
+        if (stats != null) {
+            stats.record(responseTimeMillis);
+        }
+    }
+
+    public String getHost() {
+        if (hostList.isEmpty()) return null;
+
+        return switch (strategy) {
+            case ROUND_ROBIN -> getRoundRobinHost();
+            case RANDOM -> getRandomHost();
+            case LATENCY_AWARE -> getLowestLatencyHost();
+        };
+    }
+
+    private String getRoundRobinHost() {
+        int index = Math.abs(rrIndex.getAndIncrement() % hostList.size());
+        return hostList.get(index);
+    }
+
+    private String getRandomHost() {
+        return hostList.get(rand.nextInt(hostList.size()));
+    }
+
+    private String getLowestLatencyHost() {
+        String bestHost = null;
+        double bestLatency = Double.MAX_VALUE;
+
+        for (String host : hostList) {
+            HostStats stats = hostMap.get(host);
+            if (stats == null) continue;
+            double avg = stats.getAvgLatency();
+            if (avg < bestLatency) {
+                bestLatency = avg;
+                bestHost = host;
+            }
+        }
+
+        return bestHost != null ? bestHost : getRandomHost(); // fallback
+    }
+
+    public Map<String, Double> getStats() {
+        Map<String, Double> result = new HashMap<>();
+        for (String host : hostList) {
+            HostStats stats = hostMap.get(host);
+            if (stats != null) {
+                result.put(host, stats.getAvgLatency());
+            }
+        }
+        return result;
+    }
+}
