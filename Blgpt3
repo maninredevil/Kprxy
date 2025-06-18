@@ -1,0 +1,171 @@
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class LatencyBasedLoadBalancer {
+
+    public enum Strategy {
+        LATENCY_AWARE,
+        ROUND_ROBIN,
+        RANDOM,
+        LATENCY_SMOOTH_WEIGHTED
+    }
+
+    private static final long WINDOW_MILLIS = 5 * 60 * 1000;
+    private static final double EPSILON = 1e-3;
+    private static final double MAX_SENSITIVITY = 5.0;
+
+    private static class ResponseRecord {
+        final long time;
+        final long timestamp;
+
+        ResponseRecord(long time, long timestamp) {
+            this.time = time;
+            this.timestamp = timestamp;
+        }
+    }
+
+    private static class HostStats {
+        final String host;
+        final ConcurrentLinkedDeque<ResponseRecord> responses = new ConcurrentLinkedDeque<>();
+
+        HostStats(String host) {
+            this.host = host;
+        }
+
+        void record(long time) {
+            long now = System.currentTimeMillis();
+            responses.addLast(new ResponseRecord(time, now));
+            cleanup(now);
+        }
+
+        void cleanup(long now) {
+            while (!responses.isEmpty() && now - responses.peekFirst().timestamp > WINDOW_MILLIS) {
+                responses.pollFirst();
+            }
+        }
+
+        double getAvgLatency() {
+            long now = System.currentTimeMillis();
+            cleanup(now);
+            long sum = 0;
+            int count = 0;
+            for (ResponseRecord r : responses) {
+                sum += r.time;
+                count++;
+            }
+            return count == 0 ? Double.MAX_VALUE : (double) sum / count;
+        }
+    }
+
+    private final ConcurrentHashMap<String, HostStats> hostMap = new ConcurrentHashMap<>();
+    private final CopyOnWriteArrayList<String> hostList = new CopyOnWriteArrayList<>();
+    private final AtomicInteger rrIndex = new AtomicInteger(0);
+    private volatile Strategy strategy = Strategy.LATENCY_SMOOTH_WEIGHTED;
+    private final ThreadLocalRandom rand = ThreadLocalRandom.current();
+    private volatile int smoothness = 100;
+
+    public void setStrategy(Strategy s) {
+        strategy = s;
+    }
+
+    public void setSmoothness(int value) {
+        if (value < 0 || value > 100) throw new IllegalArgumentException("smoothness must be between 0 and 100");
+        this.smoothness = value;
+    }
+
+    public void addHost(String host) {
+        hostMap.putIfAbsent(host, new HostStats(host));
+        hostList.addIfAbsent(host);
+    }
+
+    public void removeHost(String host) {
+        hostMap.remove(host);
+        hostList.remove(host);
+    }
+
+    public void recordResponse(String host, long responseTimeMillis) {
+        HostStats stats = hostMap.get(host);
+        if (stats != null) stats.record(responseTimeMillis);
+    }
+
+    public String getHost() {
+        if (hostList.isEmpty()) return null;
+
+        return switch (strategy) {
+            case ROUND_ROBIN -> getRoundRobin();
+            case RANDOM -> getRandom();
+            case LATENCY_AWARE -> getFastest();
+            case LATENCY_SMOOTH_WEIGHTED -> getSmoothWeighted();
+        };
+    }
+
+    private String getRoundRobin() {
+        int idx = Math.abs(rrIndex.getAndIncrement()) % hostList.size();
+        return hostList.get(idx);
+    }
+
+    private String getRandom() {
+        return hostList.get(rand.nextInt(hostList.size()));
+    }
+
+    private String getFastest() {
+        String best = null;
+        double bestLatency = Double.MAX_VALUE;
+        for (String host : hostList) {
+            HostStats stats = hostMap.get(host);
+            if (stats == null) continue;
+            double latency = stats.getAvgLatency();
+            if (latency < bestLatency) {
+                bestLatency = latency;
+                best = host;
+            }
+        }
+        return best != null ? best : getRandom();
+    }
+
+    private String getSmoothWeighted() {
+        double alpha = (smoothness / 100.0) * MAX_SENSITIVITY;
+
+        Map<String, Double> weights = new HashMap<>();
+        double totalWeight = 0;
+
+        for (String host : hostList) {
+            HostStats stats = hostMap.get(host);
+            if (stats == null) continue;
+            double latency = stats.getAvgLatency();
+            double weight = 1.0 / Math.pow(latency + EPSILON, alpha);
+            weights.put(host, weight);
+            totalWeight += weight;
+        }
+
+        double r = rand.nextDouble() * totalWeight;
+        double cumulative = 0;
+
+        for (Map.Entry<String, Double> entry : weights.entrySet()) {
+            cumulative += entry.getValue();
+            if (r <= cumulative) return entry.getKey();
+        }
+
+        return getRandom(); // fallback
+    }
+
+    public Map<String, Double> getStats() {
+        Map<String, Double> result = new HashMap<>();
+        for (String host : hostList) {
+            HostStats stats = hostMap.get(host);
+            if (stats != null) result.put(host, stats.getAvgLatency());
+        }
+        return result;
+    }
+}
+
+
+LatencyBasedLoadBalancer lb = new LatencyBasedLoadBalancer();
+lb.addHost("192.168.1.10");
+lb.addHost("192.168.1.11");
+
+lb.setStrategy(LatencyBasedLoadBalancer.Strategy.LATENCY_SMOOTH_WEIGHTED);
+
+// Плавность: 0 = равномерно, 100 = агрессивно
+lb.setSmoothness(30);  // умеренное предпочтение быстрого
