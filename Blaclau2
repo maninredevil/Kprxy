@@ -1,0 +1,768 @@
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.StampedLock;
+
+/**
+ * Высокопроизводительный балансировщик нагрузки для 20к+ RPS
+ * Оптимизирован для минимальных блокировок и максимальной производительности
+ */
+public class HighPerformanceLoadBalancer {
+    
+    private final ConcurrentHashMap<String, HostMetrics> hostMetrics;
+    private final long historyWindowMillis;
+    private final double biasCoefficient;
+    
+    // Lock-free кэширование для getHost()
+    private volatile HostSelector cachedSelector;
+    private final AtomicLong lastSelectorUpdate = new AtomicLong(0);
+    private static final long SELECTOR_CACHE_MILLIS = 50; // Агрессивный кэш для RPS
+    
+    // Batch processing для очистки
+    private final AtomicLong cleanupCounter = new AtomicLong(0);
+    private static final int CLEANUP_BATCH_SIZE = 1000; // Очистка каждые 1000 записей
+    
+    // Thread-local random для распределения нагрузки
+    private static final ThreadLocal<SplittableRandom> THREAD_LOCAL_RANDOM = 
+        ThreadLocal.withInitial(SplittableRandom::new);
+    
+    /**
+     * Конструктор с параметрами по умолчанию
+     */
+    public HighPerformanceLoadBalancer() {
+        this(5, 2.0);
+    }
+    
+    /**
+     * Конструктор с настраиваемыми параметрами
+     */
+    public HighPerformanceLoadBalancer(int historyWindowMinutes, double biasCoefficient) {
+        this.hostMetrics = new ConcurrentHashMap<>(32, 0.75f, 16); // Оптимизация для concurrency
+        this.historyWindowMillis = historyWindowMinutes * 60L * 1000L;
+        this.biasCoefficient = biasCoefficient;
+        this.cachedSelector = new HostSelector(new String[0], new double[0], 0);
+    }
+    
+    /**
+     * Добавляет хост в балансировщик
+     */
+    public void addHost(String host) {
+        if (host == null || host.trim().isEmpty()) {
+            throw new IllegalArgumentException("Host cannot be null or empty");
+        }
+        
+        if (hostMetrics.putIfAbsent(host, new HostMetrics()) == null) {
+            invalidateSelector();
+        }
+    }
+    
+    /**
+     * Удаляет хост из балансировщика
+     */
+    public void removeHost(String host) {
+        if (hostMetrics.remove(host) != null) {
+            invalidateSelector();
+        }
+    }
+    
+    /**
+     * Записывает latency для хоста - максимально оптимизированная версия
+     */
+    public void recordLatency(String host, long latencyMillis) {
+        if (latencyMillis < 0) return; // Быстрый выход без исключения
+        
+        HostMetrics metrics = hostMetrics.get(host);
+        if (metrics != null) {
+            metrics.recordLatency(latencyMillis);
+            
+            // Периодическая инвалидация селектора
+            if ((cleanupCounter.incrementAndGet() & 0xFF) == 0) { // Каждые 256 записей
+                invalidateSelector();
+            }
+        }
+    }
+    
+    /**
+     * Выбирает оптимальный хост - максимально быстрая версия
+     */
+    public String getHost() {
+        HostSelector selector = cachedSelector;
+        long now = System.currentTimeMillis();
+        
+        // Проверяем актуальность селектора без блокировок
+        if (now - selector.timestamp > SELECTOR_CACHE_MILLIS) {
+            selector = updateSelector(now);
+        }
+        
+        return selector.selectHost();
+    }
+    
+    /**
+     * Выводит статистику по всем хостам
+     */
+    public void printStatistics() {
+        System.out.println("=== Load Balancer Statistics (High-Performance) ===");
+        System.out.printf("%-20s %-15s %-10s %-15s %-20s%n", 
+            "Host", "Avg Latency (ms)", "Records", "Current Load", "Last Response");
+        System.out.println("-".repeat(85));
+        
+        long now = System.currentTimeMillis();
+        hostMetrics.entrySet().stream()
+            .sorted(Map.Entry.comparingByKey())
+            .forEach(entry -> {
+                String host = entry.getKey();
+                HostMetrics metrics = entry.getValue();
+                HostStats stats = metrics.getStats(now);
+                
+                String lastResponse = stats.lastResponseTime > 0 
+                    ? String.format("%d ms ago", now - stats.lastResponseTime)
+                    : "Never";
+                    
+                System.out.printf("%-20s %-15.2f %-10d %-15.2f %-20s%n",
+                    host, stats.averageLatency, stats.totalRecords, 
+                    stats.recentLoad, lastResponse);
+            });
+        
+        HostSelector current = cachedSelector;
+        System.out.printf("%nCache: %d hosts, updated %d ms ago%n", 
+            current.hosts.length, System.currentTimeMillis() - current.timestamp);
+        System.out.println();
+    }
+    
+    // === Приватные методы ===
+    
+    private void invalidateSelector() {
+        lastSelectorUpdate.set(0); // Атомарная инвалидация
+    }
+    
+    private HostSelector updateSelector(long now) {
+        // Попытка обновления только одним потоком
+        if (lastSelectorUpdate.compareAndSet(0, now) || 
+            now - lastSelectorUpdate.get() > SELECTOR_CACHE_MILLIS) {
+            
+            HostSelector newSelector = buildSelector(now);
+            cachedSelector = newSelector;
+            lastSelectorUpdate.set(now);
+            return newSelector;
+        }
+        
+        return cachedSelector; // Возвращаем текущий, если обновление уже в процессе
+    }
+    
+    private HostSelector buildSelector(long now) {
+        List<HostCandidate> candidates = new ArrayList<>(hostMetrics.size());
+        
+        // Собираем кандидатов с их метриками
+        for (Map.Entry<String, HostMetrics> entry : hostMetrics.entrySet()) {
+            String host = entry.getKey();
+            HostStats stats = entry.getValue().getStats(now);
+            
+            if (stats.totalRecords > 0) {
+                // Учитываем как среднюю latency, так и текущую нагрузку
+                double effectiveLatency = stats.averageLatency * (1.0 + stats.recentLoad * 0.1);
+                candidates.add(new HostCandidate(host, effectiveLatency));
+            } else {
+                // Хосты без статистики получают средний приоритет
+                candidates.add(new HostCandidate(host, 100.0));
+            }
+        }
+        
+        if (candidates.isEmpty()) {
+            return new HostSelector(new String[0], new double[0], now);
+        }
+        
+        // Применяем bias и создаем weighted selector
+        return createWeightedSelector(candidates, now);
+    }
+    
+    private HostSelector createWeightedSelector(List<HostCandidate> candidates, long timestamp) {
+        if (candidates.size() == 1) {
+            return new HostSelector(
+                new String[]{candidates.get(0).host}, 
+                new double[]{1.0}, 
+                timestamp
+            );
+        }
+        
+        // Находим лучшую latency
+        double minLatency = candidates.stream()
+            .mapToDouble(c -> c.latency)
+            .min().orElse(1.0);
+        
+        // Вычисляем веса с bias
+        String[] hosts = new String[candidates.size()];
+        double[] weights = new double[candidates.size()];
+        double totalWeight = 0.0;
+        
+        for (int i = 0; i < candidates.size(); i++) {
+            HostCandidate candidate = candidates.get(i);
+            hosts[i] = candidate.host;
+            
+            // Инвертируем latency для весов (меньше latency = больше вес)
+            double ratio = minLatency / candidate.latency;
+            weights[i] = Math.pow(ratio, biasCoefficient);
+            totalWeight += weights[i];
+        }
+        
+        // Нормализуем веса и создаем кумулятивное распределение
+        for (int i = 0; i < weights.length; i++) {
+            weights[i] /= totalWeight;
+            if (i > 0) weights[i] += weights[i - 1];
+        }
+        
+        return new HostSelector(hosts, weights, timestamp);
+    }
+    
+    // === Внутренние классы ===
+    
+    /**
+     * Lock-free селектор хостов с предвычисленными весами
+     */
+    private static class HostSelector {
+        final String[] hosts;
+        final double[] cumulativeWeights;
+        final long timestamp;
+        
+        HostSelector(String[] hosts, double[] weights, long timestamp) {
+            this.hosts = hosts;
+            this.cumulativeWeights = weights;
+            this.timestamp = timestamp;
+        }
+        
+        String selectHost() {
+            if (hosts.length == 0) return null;
+            if (hosts.length == 1) return hosts[0];
+            
+            double random = THREAD_LOCAL_RANDOM.get().nextDouble();
+            
+            // Бинарный поиск по кумулятивным весам
+            int index = Arrays.binarySearch(cumulativeWeights, random);
+            if (index < 0) {
+                index = -index - 1;
+            }
+            
+            return hosts[Math.min(index, hosts.length - 1)];
+        }
+    }
+    
+    /**
+     * Метрики хоста с оптимизацией для высокой нагрузки
+     */
+    private class HostMetrics {
+        // Используем ring buffer для фиксированного размера истории
+        private static final int RING_BUFFER_SIZE = 1024;
+        private final AtomicReferenceArray<LatencyRecord> ringBuffer;
+        private final AtomicInteger writeIndex = new AtomicInteger(0);
+        private final AtomicLong lastResponseTime = new AtomicLong(0);
+        private final AtomicLong totalRecords = new AtomicLong(0);
+        
+        public HostMetrics() {
+            this.ringBuffer = new AtomicReferenceArray<>(RING_BUFFER_SIZE);
+        }
+        
+        public void recordLatency(long latencyMillis) {
+            long now = System.currentTimeMillis();
+            
+            // Lock-free запись в ring buffer
+            int index = writeIndex.getAndIncrement() & (RING_BUFFER_SIZE - 1);
+            ringBuffer.set(index, new LatencyRecord(latencyMillis, now));
+            
+            lastResponseTime.set(now);
+            totalRecords.incrementAndGet();
+        }
+        
+        public HostStats getStats(long now) {
+            long cutoff = now - historyWindowMillis;
+            double totalLatency = 0.0;
+            int validCount = 0;
+            int recentCount = 0; // За последние 10 секунд
+            long recentCutoff = now - 10000;
+            
+            // Быстрый проход по ring buffer
+            for (int i = 0; i < RING_BUFFER_SIZE; i++) {
+                LatencyRecord record = ringBuffer.get(i);
+                if (record != null && record.timestamp >= cutoff) {
+                    totalLatency += record.latency;
+                    validCount++;
+                    
+                    if (record.timestamp >= recentCutoff) {
+                        recentCount++;
+                    }
+                }
+            }
+            
+            double avgLatency = validCount > 0 ? totalLatency / validCount : 0.0;
+            double recentLoad = recentCount / 10.0; // RPS за последние 10 сек
+            
+            return new HostStats(avgLatency, validCount, totalRecords.get(), 
+                               recentLoad, lastResponseTime.get());
+        }
+    }
+    
+    /**
+     * Компактная запись о latency
+     */
+    private static class LatencyRecord {
+        final int latency; // int вместо long для экономии памяти
+        final long timestamp;
+        
+        LatencyRecord(long latency, long timestamp) {
+            this.latency = (int) Math.min(latency, Integer.MAX_VALUE);
+            this.timestamp = timestamp;
+        }
+    }
+    
+    /**
+     * Расширенная статистика хоста
+     */
+    private static class HostStats {
+        final double averageLatency;
+        final int validRecords;
+        final long totalRecords;
+        final double recentLoad; // RPS
+        final long lastResponseTime;
+        
+        HostStats(double averageLatency, int validRecords, long totalRecords,
+                 double recentLoad, long lastResponseTime) {
+            this.averageLatency = averageLatency;
+            this.validRecords = validRecords;
+            this.totalRecords = totalRecords;
+            this.recentLoad = recentLoad;
+            this.lastResponseTime = lastResponseTime;
+        }
+    }
+    
+    /**
+     * Кандидат для выбора
+     */
+    private static class HostCandidate {
+        final String host;
+        final double latency;
+        
+        HostCandidate(String host, double latency) {
+            this.host = host;
+            this.latency = latency;
+        }
+    }
+    
+    // === Бенчмарк и тестирование ===
+    
+    public static void main(String[] args) throws Exception {
+        HighPerformanceLoadBalancer balancer = new HighPerformanceLoadBalancer();
+        
+        // Добавляем хосты
+        for (int i = 1; i <= 10; i++) {
+            balancer.addHost("server" + i + ".example.com");
+        }
+        
+        // Прогрев
+        System.out.println("Warming up...");
+        warmUp(balancer);
+        
+        // Бенчмарк getHost()
+        System.out.println("Benchmarking getHost() performance...");
+        benchmarkGetHost(balancer);
+        
+        // Бенчмарк recordLatency()
+        System.out.println("Benchmarking recordLatency() performance...");
+        benchmarkRecordLatency(balancer);
+        
+        // Финальная статистика
+        balancer.printStatistics();
+    }
+    
+    private static void warmUp(HighPerformanceLoadBalancer balancer) {
+        // Заполняем данными
+        String[] hosts = {"server1.example.com", "server2.example.com", "server3.example.com"};
+        Random random = new Random();
+        
+        for (int i = 0; i < 10000; i++) {
+            String host = hosts[i % hosts.length];
+            balancer.recordLatency(host, 50 + random.nextInt(100));
+            balancer.getHost();
+        }
+    }
+    
+    private static void benchmarkGetHost(HighPerformanceLoadBalancer balancer) {
+        int iterations = 1_000_000;
+        long start = System.nanoTime();
+        
+        for (int i = 0; i < iterations; i++) {
+            balancer.getHost();
+        }
+        
+        long end = System.nanoTime();
+        double rps = iterations * 1_000_000_000.0 / (end - start);
+        System.out.printf("getHost() RPS: %.0f%n", rps);
+    }
+    
+    private static void benchmarkRecordLatency(HighPerformanceLoadBalancer balancer) {
+        int iterations = 1_000_000;
+        String[] hosts = {"server1.example.com", "server2.example.com", "server3.example.com"};
+        Random random = new Random();
+        
+        long start = System.nanoTime();
+        
+        for (int i = 0; i < iterations; i++) {
+            String host = hosts[i % hosts.length];
+            balancer.recordLatency(host, 50 + random.nextInt(100));
+        }
+        
+        long end = System.nanoTime();
+        double rps = iterations * 1_000_000_000.0 / (end - start);
+        System.out.printf("recordLatency() RPS: %.0f%n", rps);
+    }
+}
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.StampedLock;
+import java.util.stream.Collectors;
+
+/**
+ * Высокопроизводительный балансировщик нагрузки с учетом latency
+ * Потокобезопасный компонент для выбора оптимального хоста
+ */
+public class HighPerformanceLoadBalancer {
+    
+    private final ConcurrentHashMap<String, HostMetrics> hostMetrics;
+    private final StampedLock cacheLock = new StampedLock();
+    private final long historyWindowMillis;
+    private final double biasCoefficient;
+    
+    // Кэш для избежания пересчетов
+    private volatile CachedSelection cachedSelection;
+    private volatile long lastCacheUpdate = 0;
+    private static final long CACHE_VALIDITY_MILLIS = 100; // 100ms кэш
+    
+    /**
+     * Конструктор с параметрами по умолчанию
+     */
+    public HighPerformanceLoadBalancer() {
+        this(5, 2.0);
+    }
+    
+    /**
+     * Конструктор с настраиваемыми параметрами
+     * @param historyWindowMinutes окно истории в минутах
+     * @param biasCoefficient коэффициент смещения для быстрых хостов
+     */
+    public HighPerformanceLoadBalancer(int historyWindowMinutes, double biasCoefficient) {
+        this.hostMetrics = new ConcurrentHashMap<>();
+        this.historyWindowMillis = historyWindowMinutes * 60L * 1000L;
+        this.biasCoefficient = biasCoefficient;
+        this.cachedSelection = new CachedSelection(Collections.emptyList(), System.currentTimeMillis());
+    }
+    
+    /**
+     * Добавляет хост в балансировщик
+     */
+    public void addHost(String host) {
+        if (host == null || host.trim().isEmpty()) {
+            throw new IllegalArgumentException("Host cannot be null or empty");
+        }
+        
+        hostMetrics.putIfAbsent(host, new HostMetrics());
+        invalidateCache();
+    }
+    
+    /**
+     * Удаляет хост из балансировщика
+     */
+    public void removeHost(String host) {
+        if (hostMetrics.remove(host) != null) {
+            invalidateCache();
+        }
+    }
+    
+    /**
+     * Записывает latency для хоста
+     */
+    public void recordLatency(String host, long latencyMillis) {
+        if (latencyMillis < 0) {
+            throw new IllegalArgumentException("Latency cannot be negative");
+        }
+        
+        HostMetrics metrics = hostMetrics.get(host);
+        if (metrics != null) {
+            metrics.recordLatency(latencyMillis);
+            invalidateCache();
+        }
+    }
+    
+    /**
+     * Выбирает оптимальный хост на основе latency
+     */
+    public String getHost() {
+        long stamp = cacheLock.tryOptimisticRead();
+        CachedSelection current = cachedSelection;
+        
+        if (!cacheLock.validate(stamp) || isCacheExpired(current)) {
+            stamp = cacheLock.writeLock();
+            try {
+                current = cachedSelection;
+                if (isCacheExpired(current)) {
+                    current = calculateOptimalHosts();
+                    cachedSelection = current;
+                    lastCacheUpdate = System.currentTimeMillis();
+                }
+            } finally {
+                cacheLock.unlockWrite(stamp);
+            }
+        }
+        
+        return selectFromCandidates(current.candidates);
+    }
+    
+    /**
+     * Выводит статистику по всем хостам
+     */
+    public void printStatistics() {
+        System.out.println("=== Load Balancer Statistics ===");
+        System.out.printf("%-20s %-15s %-10s %-20s%n", 
+            "Host", "Avg Latency (ms)", "Records", "Last Response");
+        System.out.println("-".repeat(70));
+        
+        List<Map.Entry<String, HostMetrics>> sortedHosts = hostMetrics.entrySet()
+            .stream()
+            .sorted(Map.Entry.comparingByKey())
+            .collect(Collectors.toList());
+            
+        for (Map.Entry<String, HostMetrics> entry : sortedHosts) {
+            String host = entry.getKey();
+            HostMetrics metrics = entry.getValue();
+            HostStats stats = metrics.getStats();
+            
+            String lastResponse = stats.lastResponseTime > 0 
+                ? new Date(stats.lastResponseTime).toString()
+                : "Never";
+                
+            System.out.printf("%-20s %-15.2f %-10d %-20s%n",
+                host, stats.averageLatency, stats.recordCount, lastResponse);
+        }
+        System.out.println();
+    }
+    
+    // === Приватные методы ===
+    
+    private boolean isCacheExpired(CachedSelection selection) {
+        return System.currentTimeMillis() - selection.timestamp > CACHE_VALIDITY_MILLIS;
+    }
+    
+    private void invalidateCache() {
+        lastCacheUpdate = 0; // Принуждает к обновлению кэша
+    }
+    
+    private CachedSelection calculateOptimalHosts() {
+        long now = System.currentTimeMillis();
+        List<HostCandidate> candidates = new ArrayList<>();
+        
+        for (Map.Entry<String, HostMetrics> entry : hostMetrics.entrySet()) {
+            String host = entry.getKey();
+            HostStats stats = entry.getValue().getStats();
+            
+            if (stats.recordCount > 0) {
+                candidates.add(new HostCandidate(host, stats.averageLatency));
+            }
+        }
+        
+        if (candidates.isEmpty()) {
+            // Возвращаем все хосты, если нет статистики
+            return new CachedSelection(
+                hostMetrics.keySet().stream()
+                    .map(host -> new HostCandidate(host, 1.0))
+                    .collect(Collectors.toList()),
+                now
+            );
+        }
+        
+        // Применяем bias для быстрых хостов
+        return new CachedSelection(applyBias(candidates), now);
+    }
+    
+    private List<HostCandidate> applyBias(List<HostCandidate> candidates) {
+        if (candidates.size() <= 1) return candidates;
+        
+        // Находим минимальную latency
+        double minLatency = candidates.stream()
+            .mapToDouble(c -> c.latency)
+            .min().orElse(0.0);
+            
+        // Вычисляем веса с учетом bias
+        return candidates.stream()
+            .map(candidate -> {
+                double ratio = minLatency / candidate.latency;
+                double weight = Math.pow(ratio, biasCoefficient);
+                return new HostCandidate(candidate.host, weight);
+            })
+            .collect(Collectors.toList());
+    }
+    
+    private String selectFromCandidates(List<HostCandidate> candidates) {
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        
+        if (candidates.size() == 1) {
+            return candidates.get(0).host;
+        }
+        
+        // Weighted random selection
+        double totalWeight = candidates.stream()
+            .mapToDouble(c -> c.latency)
+            .sum();
+            
+        double random = ThreadLocalRandom.current().nextDouble(totalWeight);
+        double cumulative = 0.0;
+        
+        for (HostCandidate candidate : candidates) {
+            cumulative += candidate.latency;
+            if (random <= cumulative) {
+                return candidate.host;
+            }
+        }
+        
+        return candidates.get(candidates.size() - 1).host;
+    }
+    
+    // === Внутренние классы ===
+    
+    /**
+     * Метрики для одного хоста
+     */
+    private class HostMetrics {
+        private final ConcurrentLinkedQueue<LatencyRecord> latencyHistory;
+        private volatile long lastResponseTime;
+        
+        public HostMetrics() {
+            this.latencyHistory = new ConcurrentLinkedQueue<>();
+        }
+        
+        public void recordLatency(long latencyMillis) {
+            long now = System.currentTimeMillis();
+            latencyHistory.offer(new LatencyRecord(latencyMillis, now));
+            lastResponseTime = now;
+            
+            // Периодическая очистка старых записей
+            if (ThreadLocalRandom.current().nextInt(10) == 0) {
+                cleanupOldRecords(now);
+            }
+        }
+        
+        public HostStats getStats() {
+            long now = System.currentTimeMillis();
+            cleanupOldRecords(now);
+            
+            List<LatencyRecord> validRecords = new ArrayList<>(latencyHistory);
+            
+            if (validRecords.isEmpty()) {
+                return new HostStats(0.0, 0, lastResponseTime);
+            }
+            
+            double avgLatency = validRecords.stream()
+                .mapToLong(r -> r.latency)
+                .average()
+                .orElse(0.0);
+                
+            return new HostStats(avgLatency, validRecords.size(), lastResponseTime);
+        }
+        
+        private void cleanupOldRecords(long now) {
+            long cutoff = now - historyWindowMillis;
+            
+            while (!latencyHistory.isEmpty() && 
+                   latencyHistory.peek().timestamp < cutoff) {
+                latencyHistory.poll();
+            }
+        }
+    }
+    
+    /**
+     * Запись о latency
+     */
+    private static class LatencyRecord {
+        final long latency;
+        final long timestamp;
+        
+        LatencyRecord(long latency, long timestamp) {
+            this.latency = latency;
+            this.timestamp = timestamp;
+        }
+    }
+    
+    /**
+     * Статистика хоста
+     */
+    private static class HostStats {
+        final double averageLatency;
+        final int recordCount;
+        final long lastResponseTime;
+        
+        HostStats(double averageLatency, int recordCount, long lastResponseTime) {
+            this.averageLatency = averageLatency;
+            this.recordCount = recordCount;
+            this.lastResponseTime = lastResponseTime;
+        }
+    }
+    
+    /**
+     * Кандидат для выбора
+     */
+    private static class HostCandidate {
+        final String host;
+        final double latency; // или weight в зависимости от контекста
+        
+        HostCandidate(String host, double latency) {
+            this.host = host;
+            this.latency = latency;
+        }
+    }
+    
+    /**
+     * Кэшированный результат выбора
+     */
+    private static class CachedSelection {
+        final List<HostCandidate> candidates;
+        final long timestamp;
+        
+        CachedSelection(List<HostCandidate> candidates, long timestamp) {
+            this.candidates = Collections.unmodifiableList(new ArrayList<>(candidates));
+            this.timestamp = timestamp;
+        }
+    }
+    
+    // === Пример использования ===
+    
+    public static void main(String[] args) throws InterruptedException {
+        HighPerformanceLoadBalancer balancer = new HighPerformanceLoadBalancer();
+        
+        // Добавляем хосты
+        balancer.addHost("server1.example.com");
+        balancer.addHost("server2.example.com");
+        balancer.addHost("server3.example.com");
+        
+        // Симулируем записи latency
+        Random random = new Random();
+        for (int i = 0; i < 100; i++) {
+            balancer.recordLatency("server1.example.com", 50 + random.nextInt(20));
+            balancer.recordLatency("server2.example.com", 100 + random.nextInt(30));
+            balancer.recordLatency("server3.example.com", 150 + random.nextInt(50));
+        }
+        
+        // Тестируем выбор хостов
+        System.out.println("=== Host Selection Test ===");
+        Map<String, Integer> selections = new HashMap<>();
+        
+        for (int i = 0; i < 1000; i++) {
+            String selected = balancer.getHost();
+            selections.merge(selected, 1, Integer::sum);
+        }
+        
+        selections.forEach((host, count) -> 
+            System.out.printf("%s: %d selections (%.1f%%)%n", 
+                host, count, count * 100.0 / 1000));
+        
+        System.out.println();
+        balancer.printStatistics();
+    }
+}
