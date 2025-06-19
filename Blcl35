@@ -1,0 +1,232 @@
+import java.time.Instant;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+
+public class LoadBalancer {
+    private final ConcurrentHashMap<String, HostStats> hosts = new ConcurrentHashMap<>();
+    private final long windowSizeMillis;
+    private final double biasCoefficient;
+    private final int updateThreshold;
+    
+    private final AtomicReference<HostScore[]> hostScoreCache = new AtomicReference<>(new HostScore[0]);
+    private final AtomicInteger operationCounter = new AtomicInteger(0);
+    
+    private static class LatencyRecord {
+        final long timestamp;
+        final long latency;
+        
+        LatencyRecord(long timestamp, long latency) {
+            this.timestamp = timestamp;
+            this.latency = latency;
+        }
+    }
+    
+    private static class HostScore {
+        final String host;
+        final double score;
+        final double avgLatency;
+        
+        HostScore(String host, double score, double avgLatency) {
+            this.host = host;
+            this.score = score;
+            this.avgLatency = avgLatency;
+        }
+    }
+    
+    private static class HostStats {
+        private final RingBuffer ringBuffer;
+        private final AtomicLong lastCleanupTime = new AtomicLong(0);
+        
+        HostStats(int capacity) {
+            this.ringBuffer = new RingBuffer(capacity);
+        }
+        
+        void recordLatency(long timestamp, long latency) {
+            ringBuffer.add(new LatencyRecord(timestamp, latency));
+        }
+        
+        double getAverageLatency(long now, long windowSize) {
+            cleanup(now, windowSize);
+            return ringBuffer.getAverageLatency(now - windowSize);
+        }
+        
+        long getRecordCount(long now, long windowSize) {
+            return ringBuffer.getRecordCount(now - windowSize);
+        }
+        
+        private void cleanup(long now, long windowSize) {
+            long lastCleanup = lastCleanupTime.get();
+            if (now - lastCleanup > 1000) { // Очистка не чаще раза в секунду
+                if (lastCleanupTime.compareAndSet(lastCleanup, now)) {
+                    ringBuffer.removeOld(now - windowSize);
+                }
+            }
+        }
+    }
+    
+    private static class RingBuffer {
+        private final LatencyRecord[] buffer;
+        private final AtomicInteger writeIndex = new AtomicInteger(0);
+        private final int capacity;
+        
+        RingBuffer(int capacity) {
+            this.capacity = capacity;
+            this.buffer = new LatencyRecord[capacity];
+        }
+        
+        void add(LatencyRecord record) {
+            int index = writeIndex.getAndIncrement() % capacity;
+            buffer[index] = record;
+        }
+        
+        void removeOld(long cutoffTime) {
+            for (int i = 0; i < capacity; i++) {
+                LatencyRecord record = buffer[i];
+                if (record != null && record.timestamp < cutoffTime) {
+                    buffer[i] = null;
+                }
+            }
+        }
+        
+        double getAverageLatency(long cutoffTime) {
+            long totalLatency = 0;
+            int count = 0;
+            
+            for (LatencyRecord record : buffer) {
+                if (record != null && record.timestamp >= cutoffTime) {
+                    totalLatency += record.latency;
+                    count++;
+                }
+            }
+            
+            return count > 0 ? (double) totalLatency / count : 0;
+        }
+        
+        long getRecordCount(long cutoffTime) {
+            return java.util.Arrays.stream(buffer)
+                .filter(r -> r != null && r.timestamp >= cutoffTime)
+                .count();
+        }
+    }
+
+    public LoadBalancer(int windowMinutes, double biasCoefficient, int updateThreshold) {
+        this.windowSizeMillis = windowMinutes * 60 * 1000L;
+        this.biasCoefficient = biasCoefficient;
+        this.updateThreshold = updateThreshold;
+    }
+
+    public void addHost(String host) {
+        // Размер буфера рассчитан на 2x записей в секунду в течение окна
+        int bufferCapacity = (int) (windowSizeMillis / 500);
+        hosts.putIfAbsent(host, new HostStats(bufferCapacity));
+        updateHostScoreCache();
+    }
+
+    public void removeHost(String host) {
+        hosts.remove(host);
+        updateHostScoreCache();
+    }
+
+    public void recordLatency(String host, long latencyMillis) {
+        HostStats stats = hosts.get(host);
+        if (stats != null) {
+            long now = System.currentTimeMillis();
+            stats.recordLatency(now, latencyMillis);
+            
+            if (operationCounter.incrementAndGet() >= updateThreshold) {
+                operationCounter.set(0);
+                updateHostScoreCache();
+            }
+        }
+    }
+
+    private void updateHostScoreCache() {
+        long now = System.currentTimeMillis();
+        
+        // Находим минимальную латентность
+        double minLatency = Double.MAX_VALUE;
+        for (HostStats stats : hosts.values()) {
+            double avgLatency = stats.getAverageLatency(now, windowSizeMillis);
+            if (avgLatency > 0) {
+                minLatency = Math.min(minLatency, avgLatency);
+            }
+        }
+
+        if (minLatency == Double.MAX_VALUE) {
+            hostScoreCache.set(new HostScore[0]);
+            return;
+        }
+
+        // Создаем новый массив счетов
+        HostScore[] scores = hosts.entrySet().stream()
+            .map(entry -> {
+                double avgLatency = entry.getValue().getAverageLatency(now, windowSizeMillis);
+                if (avgLatency <= 0) return null;
+                
+                double latencyDiff = avgLatency - minLatency;
+                double score = avgLatency * Math.exp(biasCoefficient * latencyDiff);
+                return new HostScore(entry.getKey(), score, avgLatency);
+            })
+            .filter(score -> score != null)
+            .sorted((a, b) -> Double.compare(a.score, b.score))
+            .toArray(HostScore[]::new);
+
+        hostScoreCache.set(scores);
+    }
+
+    public String getHost() {
+        HostScore[] scores = hostScoreCache.get();
+        if (scores.length == 0) {
+            return null;
+        }
+        
+        // Round-robin по топ-3 хостам
+        int topHosts = Math.min(3, scores.length);
+        int index = (int)(System.nanoTime() % topHosts);
+        return scores[index].host;
+    }
+
+    public Map<String, HostMetrics> getStatistics() {
+        Map<String, HostMetrics> stats = new ConcurrentHashMap<>();
+        long now = System.currentTimeMillis();
+
+        hosts.forEach((host, hostStats) -> {
+            double avgLatency = hostStats.getAverageLatency(now, windowSizeMillis);
+            long recordCount = hostStats.getRecordCount(now, windowSizeMillis);
+            stats.put(host, new HostMetrics(avgLatency, recordCount, now));
+        });
+
+        return stats;
+    }
+
+    public static class HostMetrics {
+        public final double averageLatency;
+        public final long recordCount;
+        public final long timestamp;
+
+        HostMetrics(double averageLatency, long recordCount, long timestamp) {
+            this.averageLatency = averageLatency;
+            this.recordCount = recordCount;
+            this.timestamp = timestamp;
+        }
+    }
+
+    public void printStatistics() {
+        Map<String, HostMetrics> stats = getStatistics();
+        System.out.println("Load Balancer Statistics (as of " + 
+            Instant.now() + "):");
+        
+        stats.forEach((host, metrics) -> {
+            System.out.printf("Host: %s%n", host);
+            System.out.printf("  Average Latency: %.2f ms%n", 
+                metrics.averageLatency);
+            System.out.printf("  Record Count: %d%n", 
+                metrics.recordCount);
+            System.out.printf("  Window: Last %d minutes%n", 
+                windowSizeMillis / (60 * 1000));
+        });
+    }
+}
