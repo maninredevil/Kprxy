@@ -1,3 +1,176 @@
+import java.time.Instant;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Queue;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+
+public class LoadBalancer {
+
+    private final ConcurrentHashMap<String, HostStats> hosts = new ConcurrentHashMap<>();
+    private final long windowMillis;
+    private final double biasCoefficient;
+    private final ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();
+
+    public LoadBalancer(long windowMinutes, double biasCoefficient) {
+        this.windowMillis = TimeUnit.MINUTES.toMillis(windowMinutes);
+        this.biasCoefficient = biasCoefficient;
+
+        // Периодическая чистка устаревших latency-данных
+        cleaner.scheduleAtFixedRate(this::cleanup, windowMillis / 2, windowMillis / 2, TimeUnit.MILLISECONDS);
+    }
+
+    public LoadBalancer() {
+        this(5, 1.0); // Значения по умолчанию: 5 минут, bias = 1.0
+    }
+
+    public void addHost(String host) {
+        hosts.putIfAbsent(host, new HostStats());
+    }
+
+    public void removeHost(String host) {
+        hosts.remove(host);
+    }
+
+    public void recordLatency(String host, long latencyMillis) {
+        HostStats stats = hosts.get(host);
+        if (stats != null) {
+            stats.recordLatency(latencyMillis);
+        }
+    }
+
+    public String getHost() {
+        long now = System.currentTimeMillis();
+
+        // Используем приоритетную очередь для выбора хоста с учетом bias
+        PriorityQueue<Map.Entry<String, HostStats>> pq = new PriorityQueue<>(
+            Comparator.comparingDouble(e -> biasedLatency(e.getValue(), now))
+        );
+
+        for (Map.Entry<String, HostStats> entry : hosts.entrySet()) {
+            pq.offer(entry);
+        }
+
+        Map.Entry<String, HostStats> best = pq.poll();
+        return best != null ? best.getKey() : null;
+    }
+
+    private double biasedLatency(HostStats stats, long now) {
+        double avg = stats.getAverageLatency(now, windowMillis);
+        if (avg == 0) return Double.MAX_VALUE;
+        return avg / Math.pow(stats.getRecordCount(now, windowMillis), biasCoefficient);
+    }
+
+    public void printStatistics() {
+        long now = System.currentTimeMillis();
+        System.out.println("=== Load Balancer Statistics ===");
+        for (Map.Entry<String, HostStats> entry : hosts.entrySet()) {
+            String host = entry.getKey();
+            HostStats stats = entry.getValue();
+            double avgLatency = stats.getAverageLatency(now, windowMillis);
+            long count = stats.getRecordCount(now, windowMillis);
+            long lastResponse = stats.getLastResponseTime();
+            System.out.printf("Host: %s | Avg Latency: %.2f ms | Records: %d | Last Response: %s%n",
+                host, avgLatency, count, Instant.ofEpochMilli(lastResponse));
+        }
+    }
+
+    private void cleanup() {
+        long now = System.currentTimeMillis();
+        for (HostStats stats : hosts.values()) {
+            stats.cleanupOldRecords(now, windowMillis);
+        }
+    }
+
+    public void shutdown() {
+        cleaner.shutdownNow();
+    }
+
+    private static class HostStats {
+        private final Queue<LatencyEntry> latencies = new ConcurrentLinkedQueue<>();
+        private final AtomicLong lastResponseTime = new AtomicLong(0);
+        private final ReadWriteLock lock = new ReentrantReadWriteLock();
+
+        void recordLatency(long latencyMillis) {
+            long now = System.currentTimeMillis();
+            latencies.offer(new LatencyEntry(now, latencyMillis));
+            lastResponseTime.set(now);
+        }
+
+        double getAverageLatency(long now, long windowMillis) {
+            long cutoff = now - windowMillis;
+            long total = 0;
+            int count = 0;
+
+            lock.readLock().lock();
+            try {
+                for (LatencyEntry entry : latencies) {
+                    if (entry.timestamp >= cutoff) {
+                        total += entry.latency;
+                        count++;
+                    }
+                }
+            } finally {
+                lock.readLock().unlock();
+            }
+
+            return count > 0 ? (double) total / count : 0.0;
+        }
+
+        long getRecordCount(long now, long windowMillis) {
+            long cutoff = now - windowMillis;
+            int count = 0;
+
+            lock.readLock().lock();
+            try {
+                for (LatencyEntry entry : latencies) {
+                    if (entry.timestamp >= cutoff) {
+                        count++;
+                    }
+                }
+            } finally {
+                lock.readLock().unlock();
+            }
+
+            return count;
+        }
+
+        long getLastResponseTime() {
+            return lastResponseTime.get();
+        }
+
+        void cleanupOldRecords(long now, long windowMillis) {
+            long cutoff = now - windowMillis;
+
+            lock.writeLock().lock();
+            try {
+                while (!latencies.isEmpty()) {
+                    LatencyEntry head = latencies.peek();
+                    if (head != null && head.timestamp < cutoff) {
+                        latencies.poll();
+                    } else {
+                        break;
+                    }
+                }
+            } finally {
+                lock.writeLock().unlock();
+            }
+        }
+    }
+
+    private static class LatencyEntry {
+        final long timestamp;
+        final long latency;
+
+        LatencyEntry(long timestamp, long latency) {
+            this.timestamp = timestamp;
+            this.latency = latency;
+        }
+    }
+}
+
+
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
