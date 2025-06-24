@@ -1,4 +1,186 @@
 import java.util.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+
+public class LatencyBalancerOptimized {
+
+    private static class TimeSlot {
+        final AtomicLong latencySum = new AtomicLong(0);
+        final AtomicLong count = new AtomicLong(0);
+
+        void addLatency(long latency) {
+            latencySum.addAndGet(latency);
+            count.incrementAndGet();
+        }
+
+        long getLatencySum() {
+            return latencySum.get();
+        }
+
+        long getCount() {
+            return count.get();
+        }
+
+        void reset() {
+            latencySum.set(0);
+            count.set(0);
+        }
+    }
+
+    private static class HostMetrics {
+        private final int slotsCount;
+        private final long slotDurationMillis;
+        private final TimeSlot[] slots;
+        private final AtomicInteger currentSlotIndex = new AtomicInteger(0);
+        private volatile long windowStartTime; // начало текущего слота
+        private final ReadWriteLock lock = new ReentrantReadWriteLock();
+
+        HostMetrics(long windowMillis, int slotsCount) {
+            this.slotsCount = slotsCount;
+            this.slotDurationMillis = windowMillis / slotsCount;
+            this.slots = new TimeSlot[slotsCount];
+            for (int i = 0; i < slotsCount; i++) {
+                slots[i] = new TimeSlot();
+            }
+            this.windowStartTime = System.currentTimeMillis();
+        }
+
+        void recordLatency(long latency) {
+            long now = System.currentTimeMillis();
+            advanceSlotIfNeeded(now);
+
+            int idx = currentSlotIndex.get();
+            slots[idx].addLatency(latency);
+        }
+
+        private void advanceSlotIfNeeded(long now) {
+            long elapsed = now - windowStartTime;
+            if (elapsed < slotDurationMillis) {
+                return; // всё ещё в текущем слоте
+            }
+
+            lock.writeLock().lock();
+            try {
+                // пересчитываем сколько слотов нужно сместить
+                long slotsToAdvance = elapsed / slotDurationMillis;
+                if (slotsToAdvance > slotsCount) {
+                    // если прошло слишком много времени, сбросить все слоты
+                    for (TimeSlot slot : slots) {
+                        slot.reset();
+                    }
+                    slotsToAdvance = slotsCount;
+                } else {
+                    // сбрасываем пройденные слоты
+                    for (int i = 1; i <= slotsToAdvance; i++) {
+                        int idxToReset = (currentSlotIndex.get() + i) % slotsCount;
+                        slots[idxToReset].reset();
+                    }
+                }
+                currentSlotIndex.set((int) ((currentSlotIndex.get() + slotsToAdvance) % slotsCount));
+                windowStartTime += slotsToAdvance * slotDurationMillis;
+            } finally {
+                lock.writeLock().unlock();
+            }
+        }
+
+        double getAverageLatency() {
+            long now = System.currentTimeMillis();
+            advanceSlotIfNeeded(now);
+
+            lock.readLock().lock();
+            try {
+                long sum = 0;
+                long cnt = 0;
+                for (TimeSlot slot : slots) {
+                    sum += slot.getLatencySum();
+                    cnt += slot.getCount();
+                }
+                return cnt == 0 ? Double.MAX_VALUE : (double) sum / cnt;
+            } finally {
+                lock.readLock().unlock();
+            }
+        }
+    }
+
+    private final ConcurrentHashMap<String, HostMetrics> hosts = new ConcurrentHashMap<>();
+    private final long windowMillis;
+    private final int slotsCount;
+    
+    public LatencyBalancerOptimized(long windowSeconds, int slotsCount) {
+        this.windowMillis = windowSeconds * 1000;
+        this.slotsCount = slotsCount;
+    }
+
+    public void addHost(String host) {
+        hosts.putIfAbsent(host, new HostMetrics(windowMillis, slotsCount));
+    }
+
+    public void removeHost(String host) {
+        hosts.remove(host);
+    }
+
+    public void recordResponseTime(String host, long latency) {
+        HostMetrics metrics = hosts.get(host);
+        if (metrics != null) {
+            metrics.recordLatency(latency);
+        }
+    }
+
+    public String getHost() {
+        List<Map.Entry<String, HostMetrics>> entries = new ArrayList<>(hosts.entrySet());
+        if (entries.isEmpty()) {
+            return null;
+        }
+
+        double maxLatency = Double.MIN_VALUE;
+        double minLatency = Double.MAX_VALUE;
+        Map<String, Double> avgLatencies = new HashMap<>();
+
+        for (Map.Entry<String, HostMetrics> entry : entries) {
+            double avg = entry.getValue().getAverageLatency();
+            avgLatencies.put(entry.getKey(), avg);
+            if (avg > maxLatency) maxLatency = avg;
+            if (avg < minLatency) minLatency = avg;
+        }
+
+        if (maxLatency == minLatency) {
+            return entries.get(ThreadLocalRandom.current().nextInt(entries.size())).getKey();
+        }
+
+        double totalWeight = 0;
+        Map<String, Double> weights = new HashMap<>();
+        for (String host : avgLatencies.keySet()) {
+            double latency = avgLatencies.get(host);
+            double weight = (maxLatency - latency) / (maxLatency - minLatency);
+            weight = 0.1 + 0.9 * weight;
+            weights.put(host, weight);
+            totalWeight += weight;
+        }
+
+        double r = ThreadLocalRandom.current().nextDouble() * totalWeight;
+        double cumulative = 0;
+        for (Map.Entry<String, Double> entry : weights.entrySet()) {
+            cumulative += entry.getValue();
+            if (r <= cumulative) {
+                return entry.getKey();
+            }
+        }
+        return entries.get(entries.size() - 1).getKey();
+    }
+
+    public double getHostLatencyAverage(String host) {
+        HostMetrics metrics = hosts.get(host);
+        if (metrics == null) return -1;
+        return metrics.getAverageLatency();
+    }
+
+    public Set<String> getAllHosts() {
+        return hosts.keySet();
+    }
+}
+
+
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
