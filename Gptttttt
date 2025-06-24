@@ -1,0 +1,124 @@
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
+import java.util.stream.Collectors;
+
+public class LatencyBasedLoadBalancer {
+
+    private static class LatencyEntry {
+        final long timestampMillis;
+        final long latencyMillis;
+
+        LatencyEntry(long timestampMillis, long latencyMillis) {
+            this.timestampMillis = timestampMillis;
+            this.latencyMillis = latencyMillis;
+        }
+    }
+
+    private static class HostStats {
+        final String host;
+        final Deque<LatencyEntry> latencyWindow = new ConcurrentLinkedDeque<>();
+        final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+
+        HostStats(String host) {
+            this.host = host;
+        }
+
+        void recordLatency(long latencyMillis, long nowMillis, long windowSizeMillis) {
+            lock.writeLock().lock();
+            try {
+                latencyWindow.addLast(new LatencyEntry(nowMillis, latencyMillis));
+                // Remove outdated entries
+                while (!latencyWindow.isEmpty() && nowMillis - latencyWindow.peekFirst().timestampMillis > windowSizeMillis) {
+                    latencyWindow.pollFirst();
+                }
+            } finally {
+                lock.writeLock().unlock();
+            }
+        }
+
+        double getAverageLatency(long nowMillis, long windowSizeMillis) {
+            lock.readLock().lock();
+            try {
+                List<LatencyEntry> valid = latencyWindow.stream()
+                        .filter(e -> nowMillis - e.timestampMillis <= windowSizeMillis)
+                        .collect(Collectors.toList());
+                if (valid.isEmpty()) return Double.MAX_VALUE;
+                long total = valid.stream().mapToLong(e -> e.latencyMillis).sum();
+                return total / (double) valid.size();
+            } finally {
+                lock.readLock().unlock();
+            }
+        }
+    }
+
+    private final ConcurrentHashMap<String, HostStats> hosts = new ConcurrentHashMap<>();
+    private final long windowSizeMillis;
+    private final Random random = new Random();
+
+    public LatencyBasedLoadBalancer(long windowSizeSeconds) {
+        this.windowSizeMillis = windowSizeSeconds * 1000;
+    }
+
+    public void addHost(String host) {
+        hosts.putIfAbsent(host, new HostStats(host));
+    }
+
+    public void removeHost(String host) {
+        hosts.remove(host);
+    }
+
+    public void recordResponseTime(String host, long latencyMillis) {
+        HostStats stats = hosts.get(host);
+        if (stats != null) {
+            stats.recordLatency(latencyMillis, System.currentTimeMillis(), windowSizeMillis);
+        }
+    }
+
+    public double getHostLatencyAverage(String host) {
+        HostStats stats = hosts.get(host);
+        if (stats == null) return -1;
+        return stats.getAverageLatency(System.currentTimeMillis(), windowSizeMillis);
+    }
+
+    public String getHost() {
+        long now = System.currentTimeMillis();
+        List<HostStats> available = new ArrayList<>(hosts.values());
+        if (available.isEmpty()) return null;
+
+        // Получаем latency и создаём веса: чем меньше latency, тем выше вес
+        Map<HostStats, Double> scores = new HashMap<>();
+        double totalWeight = 0;
+
+        for (HostStats h : available) {
+            double latency = h.getAverageLatency(now, windowSizeMillis);
+            double weight = latency == Double.MAX_VALUE ? 0.0 : 1.0 / (latency + 1); // +1 чтобы избежать деления на 0
+            scores.put(h, weight);
+            totalWeight += weight;
+        }
+
+        if (totalWeight == 0.0) {
+            // Все latency неизвестны — выбираем случайного
+            return available.get(random.nextInt(available.size())).host;
+        }
+
+        // Взвешенный случайный выбор
+        double r = random.nextDouble() * totalWeight;
+        double cumulative = 0.0;
+
+        for (Map.Entry<HostStats, Double> e : scores.entrySet()) {
+            cumulative += e.getValue();
+            if (r <= cumulative) {
+                return e.getKey().host;
+            }
+        }
+
+        // fallback — возвращаем случайный
+        return available.get(random.nextInt(available.size())).host;
+    }
+
+    // Метод для получения всех хостов (например, для метрик или дебага)
+    public List<String> getAllHosts() {
+        return new ArrayList<>(hosts.keySet());
+    }
+}
