@@ -5,6 +5,140 @@ import java.util.concurrent.atomic.*;
 public class LatencyBasedLoadBalancer {
 
     public enum Strategy {
+        LATENCY_BASED,
+        ROUND_ROBIN
+    }
+
+    private static class HostStats {
+        String host;
+        final ConcurrentLinkedQueue<LatencySample> samples = new ConcurrentLinkedQueue<>();
+        final LongAdder totalLatency = new LongAdder();
+        final LongAdder count = new LongAdder();
+    }
+
+    private static class LatencySample {
+        final long timestampNanos;
+        final long latencyMillis;
+
+        LatencySample(long timestampNanos, long latencyMillis) {
+            this.timestampNanos = timestampNanos;
+            this.latencyMillis = latencyMillis;
+        }
+    }
+
+    private final ConcurrentHashMap<String, HostStats> hostMap = new ConcurrentHashMap<>();
+    private volatile HostStats[] cachedHosts = new HostStats[0];
+    private final long windowSizeNanos;
+    private final ScheduledExecutorService cleanupExecutor;
+    private final Random random = ThreadLocalRandom.current();
+
+    // Для round robin
+    private final AtomicInteger rrIndex = new AtomicInteger(0);
+
+    private final Strategy strategy;
+
+    public LatencyBasedLoadBalancer(long windowSeconds, Strategy strategy) {
+        this.windowSizeNanos = TimeUnit.SECONDS.toNanos(windowSeconds);
+        this.strategy = strategy;
+        this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor();
+        this.cleanupExecutor.scheduleAtFixedRate(this::cleanOldSamples, 1, 1, TimeUnit.SECONDS);
+    }
+
+    public void shutdown() {
+        cleanupExecutor.shutdown();
+    }
+
+    public void addHost(String host) {
+        hostMap.computeIfAbsent(host, h -> {
+            HostStats stats = new HostStats();
+            stats.host = host;
+            refreshHostArray();
+            return stats;
+        });
+    }
+
+    public void removeHost(String host) {
+        hostMap.remove(host);
+        refreshHostArray();
+    }
+
+    public List<String> getAllHosts() {
+        return new ArrayList<>(hostMap.keySet());
+    }
+
+    public void recordResponseTime(String host, long latencyMillis) {
+        HostStats stats = hostMap.get(host);
+        if (stats == null) return;
+        long now = System.nanoTime();
+        stats.samples.add(new LatencySample(now, latencyMillis));
+        stats.totalLatency.add(latencyMillis);
+        stats.count.increment();
+    }
+
+    public double getHostLatencyAverage(String host) {
+        HostStats stats = hostMap.get(host);
+        if (stats == null || stats.count.sum() == 0) return Double.MAX_VALUE;
+        return stats.totalLatency.sum() / (double) stats.count.sum();
+    }
+
+    public String getHost() {
+        HostStats[] hosts = cachedHosts;
+        if (hosts.length == 0) return null;
+
+        if (strategy == Strategy.ROUND_ROBIN) {
+            int idx = Math.floorMod(rrIndex.getAndIncrement(), hosts.length);
+            return hosts[idx].host;
+        }
+
+        // LATENCY_BASED
+        double totalWeight = 0.0;
+        double[] weights = new double[hosts.length];
+        for (int i = 0; i < hosts.length; i++) {
+            long cnt = hosts[i].count.sum();
+            double latency = cnt == 0 ? Double.MAX_VALUE : (double) hosts[i].totalLatency.sum() / cnt;
+            double weight = (latency == Double.MAX_VALUE) ? 0.0 : 1.0 / (latency + 1);
+            weights[i] = weight;
+            totalWeight += weight;
+        }
+
+        if (totalWeight == 0.0) {
+            return hosts[random.nextInt(hosts.length)].host;
+        }
+
+        double r = random.nextDouble() * totalWeight;
+        double cum = 0;
+        for (int i = 0; i < weights.length; i++) {
+            cum += weights[i];
+            if (r <= cum) return hosts[i].host;
+        }
+        return hosts[random.nextInt(hosts.length)].host;
+    }
+
+    private void cleanOldSamples() {
+        long threshold = System.nanoTime() - windowSizeNanos;
+        for (HostStats stats : hostMap.values()) {
+            while (true) {
+                LatencySample s = stats.samples.peek();
+                if (s == null || s.timestampNanos >= threshold) break;
+                stats.samples.poll();
+                stats.totalLatency.add(-s.latencyMillis);
+                stats.count.decrement();
+            }
+        }
+    }
+
+    private void refreshHostArray() {
+        this.cachedHosts = hostMap.values().toArray(new HostStats[0]);
+    }
+}
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class LatencyBasedLoadBalancer {
+
+    public enum Strategy {
         LATENCY_AWARE,
         ROUND_ROBIN
     }
