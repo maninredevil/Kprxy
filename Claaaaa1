@@ -1,0 +1,400 @@
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.time.Instant;
+
+/**
+ * High-performance load balancer with latency-based weighted distribution
+ */
+public class LatencyBasedLoadBalancer {
+    
+    private static final int DEFAULT_WINDOW_SIZE_SECONDS = 30;
+    private static final int CLEANUP_INTERVAL_MS = 5000;
+    private static final double MIN_WEIGHT = 0.01;
+    private static final double LATENCY_SENSITIVITY_FACTOR = 2.0;
+    
+    private final ConcurrentHashMap<String, HostMetrics> hosts = new ConcurrentHashMap<>();
+    private final AtomicReference<List<WeightedHost>> weightedHosts = new AtomicReference<>(new ArrayList<>());
+    private final ReadWriteLock hostLock = new ReentrantReadWriteLock();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "LoadBalancer-Cleanup");
+        t.setDaemon(true);
+        return t;
+    });
+    
+    private final int windowSizeSeconds;
+    private final Random random = new ThreadLocalRandom.current();
+    
+    public LatencyBasedLoadBalancer() {
+        this(DEFAULT_WINDOW_SIZE_SECONDS);
+    }
+    
+    public LatencyBasedLoadBalancer(int windowSizeSeconds) {
+        this.windowSizeSeconds = windowSizeSeconds;
+        startCleanupTask();
+    }
+    
+    /**
+     * Добавить хост в пул
+     */
+    public void addHost(String host) {
+        if (host == null || host.trim().isEmpty()) {
+            throw new IllegalArgumentException("Host cannot be null or empty");
+        }
+        
+        hostLock.writeLock().lock();
+        try {
+            if (!hosts.containsKey(host)) {
+                hosts.put(host, new HostMetrics(host));
+                updateWeightedHosts();
+            }
+        } finally {
+            hostLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Убрать хост из пула
+     */
+    public boolean removeHost(String host) {
+        if (host == null) return false;
+        
+        hostLock.writeLock().lock();
+        try {
+            boolean removed = hosts.remove(host) != null;
+            if (removed) {
+                updateWeightedHosts();
+            }
+            return removed;
+        } finally {
+            hostLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Записать время ответа хоста
+     */
+    public void recordResponseTime(String host, long responseTimeMs) {
+        if (host == null || responseTimeMs < 0) return;
+        
+        HostMetrics metrics = hosts.get(host);
+        if (metrics != null) {
+            metrics.recordLatency(responseTimeMs);
+            // Периодически обновляем веса (не при каждом запросе для производительности)
+            if (metrics.shouldUpdateWeights()) {
+                updateWeightedHostsAsync();
+            }
+        }
+    }
+    
+    /**
+     * Получить хост для обработки запроса
+     */
+    public String getHost() {
+        List<WeightedHost> currentHosts = weightedHosts.get();
+        if (currentHosts.isEmpty()) {
+            return null;
+        }
+        
+        if (currentHosts.size() == 1) {
+            return currentHosts.get(0).host;
+        }
+        
+        // Weighted random selection
+        double totalWeight = currentHosts.get(currentHosts.size() - 1).cumulativeWeight;
+        double randomValue = random.nextDouble() * totalWeight;
+        
+        // Binary search for better performance with many hosts
+        int left = 0, right = currentHosts.size() - 1;
+        while (left < right) {
+            int mid = (left + right) / 2;
+            if (currentHosts.get(mid).cumulativeWeight < randomValue) {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        
+        return currentHosts.get(left).host;
+    }
+    
+    /**
+     * Получить среднее время latency для хоста
+     */
+    public double getHostLatencyAverage(String host) {
+        if (host == null) return -1;
+        
+        HostMetrics metrics = hosts.get(host);
+        return metrics != null ? metrics.getAverageLatency() : -1;
+    }
+    
+    /**
+     * Получить все активные хосты
+     */
+    public Set<String> getAllHosts() {
+        return new HashSet<>(hosts.keySet());
+    }
+    
+    /**
+     * Получить статистику по всем хостам
+     */
+    public Map<String, HostStats> getHostsStatistics() {
+        Map<String, HostStats> stats = new HashMap<>();
+        long now = System.currentTimeMillis();
+        
+        for (Map.Entry<String, HostMetrics> entry : hosts.entrySet()) {
+            HostMetrics metrics = entry.getValue();
+            stats.put(entry.getKey(), new HostStats(
+                metrics.getAverageLatency(),
+                metrics.getRequestCount(now - windowSizeSeconds * 1000L, now),
+                metrics.getCurrentWeight()
+            ));
+        }
+        return stats;
+    }
+    
+    /**
+     * Получить количество активных хостов
+     */
+    public int getHostCount() {
+        return hosts.size();
+    }
+    
+    /**
+     * Очистить все метрики (для тестирования)
+     */
+    public void clearMetrics() {
+        hostLock.writeLock().lock();
+        try {
+            for (HostMetrics metrics : hosts.values()) {
+                metrics.clearMetrics();
+            }
+            updateWeightedHosts();
+        } finally {
+            hostLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Закрыть балансировщик и освободить ресурсы
+     */
+    public void shutdown() {
+        scheduler.shutdown();
+        try {
+            if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+    
+    private void updateWeightedHostsAsync() {
+        // Обновляем веса асинхронно чтобы не блокировать getHost()
+        CompletableFuture.runAsync(this::updateWeightedHosts);
+    }
+    
+    private void updateWeightedHosts() {
+        hostLock.readLock().lock();
+        try {
+            List<WeightedHost> newWeightedHosts = calculateWeights();
+            weightedHosts.set(newWeightedHosts);
+        } finally {
+            hostLock.readLock().unlock();
+        }
+    }
+    
+    private List<WeightedHost> calculateWeights() {
+        if (hosts.isEmpty()) {
+            return new ArrayList<>();
+        }
+        
+        // Собираем актуальные latency
+        Map<String, Double> latencies = new HashMap<>();
+        double minLatency = Double.MAX_VALUE;
+        
+        for (Map.Entry<String, HostMetrics> entry : hosts.entrySet()) {
+            double avgLatency = entry.getValue().getAverageLatency();
+            if (avgLatency > 0) {
+                latencies.put(entry.getKey(), avgLatency);
+                minLatency = Math.min(minLatency, avgLatency);
+            }
+        }
+        
+        // Если нет данных о latency, используем равномерное распределение
+        if (latencies.isEmpty()) {
+            List<WeightedHost> result = new ArrayList<>();
+            double weight = 1.0 / hosts.size();
+            double cumulative = 0;
+            
+            for (String host : hosts.keySet()) {
+                cumulative += weight;
+                result.add(new WeightedHost(host, weight, cumulative));
+                hosts.get(host).setCurrentWeight(weight);
+            }
+            return result;
+        }
+        
+        // Вычисляем веса на основе обратной зависимости от latency
+        Map<String, Double> weights = new HashMap<>();
+        double totalWeight = 0;
+        
+        for (Map.Entry<String, Double> entry : latencies.entrySet()) {
+            // Чем больше разница в latency, тем больше разница в весах
+            double latencyRatio = entry.getValue() / minLatency;
+            double weight = Math.max(MIN_WEIGHT, 1.0 / Math.pow(latencyRatio, LATENCY_SENSITIVITY_FACTOR));
+            weights.put(entry.getKey(), weight);
+            totalWeight += weight;
+        }
+        
+        // Нормализуем веса и создаем список для weighted random selection
+        List<WeightedHost> result = new ArrayList<>();
+        double cumulativeWeight = 0;
+        
+        for (Map.Entry<String, Double> entry : weights.entrySet()) {
+            double normalizedWeight = entry.getValue() / totalWeight;
+            cumulativeWeight += entry.getValue();
+            result.add(new WeightedHost(entry.getKey(), normalizedWeight, cumulativeWeight));
+            hosts.get(entry.getKey()).setCurrentWeight(normalizedWeight);
+        }
+        
+        return result;
+    }
+    
+    private void startCleanupTask() {
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                long cutoffTime = System.currentTimeMillis() - windowSizeSeconds * 1000L;
+                for (HostMetrics metrics : hosts.values()) {
+                    metrics.cleanup(cutoffTime);
+                }
+            } catch (Exception e) {
+                // Логируем ошибку, но не прерываем работу
+                System.err.println("Error during cleanup: " + e.getMessage());
+            }
+        }, CLEANUP_INTERVAL_MS, CLEANUP_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+    
+    /**
+     * Метрики для хоста
+     */
+    private static class HostMetrics {
+        private final String host;
+        private final ConcurrentLinkedQueue<LatencyRecord> latencyRecords = new ConcurrentLinkedQueue<>();
+        private volatile double currentWeight = 1.0;
+        private volatile long lastWeightUpdate = 0;
+        private static final long WEIGHT_UPDATE_INTERVAL_MS = 1000; // Обновляем веса не чаще раза в секунду
+        
+        public HostMetrics(String host) {
+            this.host = host;
+        }
+        
+        public void recordLatency(long latencyMs) {
+            latencyRecords.offer(new LatencyRecord(System.currentTimeMillis(), latencyMs));
+        }
+        
+        public double getAverageLatency() {
+            long now = System.currentTimeMillis();
+            long windowStart = now - 30000; // 30 секунд
+            
+            double sum = 0;
+            int count = 0;
+            
+            for (LatencyRecord record : latencyRecords) {
+                if (record.timestamp >= windowStart) {
+                    sum += record.latency;
+                    count++;
+                }
+            }
+            
+            return count > 0 ? sum / count : 0;
+        }
+        
+        public int getRequestCount(long startTime, long endTime) {
+            int count = 0;
+            for (LatencyRecord record : latencyRecords) {
+                if (record.timestamp >= startTime && record.timestamp <= endTime) {
+                    count++;
+                }
+            }
+            return count;
+        }
+        
+        public void cleanup(long cutoffTime) {
+            while (!latencyRecords.isEmpty() && latencyRecords.peek().timestamp < cutoffTime) {
+                latencyRecords.poll();
+            }
+        }
+        
+        public void clearMetrics() {
+            latencyRecords.clear();
+            currentWeight = 1.0;
+        }
+        
+        public boolean shouldUpdateWeights() {
+            long now = System.currentTimeMillis();
+            return now - lastWeightUpdate > WEIGHT_UPDATE_INTERVAL_MS;
+        }
+        
+        public void setCurrentWeight(double weight) {
+            this.currentWeight = weight;
+            this.lastWeightUpdate = System.currentTimeMillis();
+        }
+        
+        public double getCurrentWeight() {
+            return currentWeight;
+        }
+    }
+    
+    /**
+     * Запись о latency
+     */
+    private static class LatencyRecord {
+        final long timestamp;
+        final long latency;
+        
+        public LatencyRecord(long timestamp, long latency) {
+            this.timestamp = timestamp;
+            this.latency = latency;
+        }
+    }
+    
+    /**
+     * Хост с весом для weighted random selection
+     */
+    private static class WeightedHost {
+        final String host;
+        final double weight;
+        final double cumulativeWeight;
+        
+        public WeightedHost(String host, double weight, double cumulativeWeight) {
+            this.host = host;
+            this.weight = weight;
+            this.cumulativeWeight = cumulativeWeight;
+        }
+    }
+    
+    /**
+     * Статистика хоста
+     */
+    public static class HostStats {
+        public final double averageLatency;
+        public final int requestCount;
+        public final double currentWeight;
+        
+        public HostStats(double averageLatency, int requestCount, double currentWeight) {
+            this.averageLatency = averageLatency;
+            this.requestCount = requestCount;
+            this.currentWeight = currentWeight;
+        }
+        
+        @Override
+        public String toString() {
+            return String.format("HostStats{avgLatency=%.2fms, requests=%d, weight=%.3f}", 
+                               averageLatency, requestCount, currentWeight);
+        }
+    }
+}
