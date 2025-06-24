@@ -1,5 +1,142 @@
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class LatencyBalancer {
+    private static class LatencyRecord {
+        final long timestamp; // миллисекунды
+        final long latency;   // миллисекунды
+
+        LatencyRecord(long timestamp, long latency) {
+            this.timestamp = timestamp;
+            this.latency = latency;
+        }
+    }
+
+    private static class HostMetrics {
+        private final Deque<LatencyRecord> latencyRecords = new ConcurrentLinkedDeque<>();
+        private final long windowMillis;
+
+        HostMetrics(long windowMillis) {
+            this.windowMillis = windowMillis;
+        }
+
+        void recordLatency(long latency) {
+            long now = System.currentTimeMillis();
+            latencyRecords.addLast(new LatencyRecord(now, latency));
+            cleanOld(now);
+        }
+
+        private void cleanOld(long now) {
+            while (!latencyRecords.isEmpty() && now - latencyRecords.peekFirst().timestamp > windowMillis) {
+                latencyRecords.pollFirst();
+            }
+        }
+
+        double getAverageLatency() {
+            long now = System.currentTimeMillis();
+            cleanOld(now);
+
+            long sum = 0;
+            int count = 0;
+            for (LatencyRecord record : latencyRecords) {
+                sum += record.latency;
+                count++;
+            }
+            return count == 0 ? Double.MAX_VALUE : (double) sum / count;
+        }
+    }
+
+    private final ConcurrentHashMap<String, HostMetrics> hosts = new ConcurrentHashMap<>();
+    private final long windowMillis;
+    private final Random random = new Random();
+
+    public LatencyBalancer(long windowSeconds) {
+        this.windowMillis = windowSeconds * 1000;
+    }
+
+    public void addHost(String host) {
+        hosts.putIfAbsent(host, new HostMetrics(windowMillis));
+    }
+
+    public void removeHost(String host) {
+        hosts.remove(host);
+    }
+
+    public void recordResponseTime(String host, long latency) {
+        HostMetrics metrics = hosts.get(host);
+        if (metrics != null) {
+            metrics.recordLatency(latency);
+        }
+    }
+
+    public String getHost() {
+        List<Map.Entry<String, HostMetrics>> entries = new ArrayList<>(hosts.entrySet());
+        if (entries.isEmpty()) {
+            return null;
+        }
+
+        // Получаем latency всех хостов
+        double maxLatency = Double.MIN_VALUE;
+        double minLatency = Double.MAX_VALUE;
+        Map<String, Double> avgLatencies = new HashMap<>();
+
+        for (Map.Entry<String, HostMetrics> entry : entries) {
+            double avg = entry.getValue().getAverageLatency();
+            avgLatencies.put(entry.getKey(), avg);
+            if (avg > maxLatency) maxLatency = avg;
+            if (avg < minLatency) minLatency = avg;
+        }
+
+        // Если все latencies равны (например, только новые хосты), отдаём равномерно
+        if (maxLatency == minLatency) {
+            return entries.get(random.nextInt(entries.size())).getKey();
+        }
+
+        // Рассчитываем веса обратно пропорционально latency, учитывая разницу
+        // Чем меньше latency — тем выше вес
+        // weight = (maxLatency - latency) / (maxLatency - minLatency)
+        // Добавим небольшое смещение, чтобы веса не были 0
+
+        double totalWeight = 0;
+        Map<String, Double> weights = new HashMap<>();
+        for (String host : avgLatencies.keySet()) {
+            double latency = avgLatencies.get(host);
+            double weight = (maxLatency - latency) / (maxLatency - minLatency);
+            // минимальный вес для плавности, например 0.1
+            weight = 0.1 + 0.9 * weight;
+            weights.put(host, weight);
+            totalWeight += weight;
+        }
+
+        // Взвешенный рандом
+        double r = random.nextDouble() * totalWeight;
+        double cumulative = 0;
+        for (Map.Entry<String, Double> entry : weights.entrySet()) {
+            cumulative += entry.getValue();
+            if (r <= cumulative) {
+                return entry.getKey();
+            }
+        }
+
+        // На всякий случай вернуть последний
+        return entries.get(entries.size() - 1).getKey();
+    }
+
+    public double getHostLatencyAverage(String host) {
+        HostMetrics metrics = hosts.get(host);
+        if (metrics == null) return -1;
+        return metrics.getAverageLatency();
+    }
+
+    public Set<String> getAllHosts() {
+        return hosts.keySet();
+    }
+}
+
+
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 
 public class LatencyBasedLoadBalancer {
