@@ -1,5 +1,98 @@
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class LatencyBasedLoadBalancerTest {
+
+    public static void main(String[] args) throws InterruptedException {
+        LatencyBasedLoadBalancer lb = new LatencyBasedLoadBalancer(10); // 10 секунд окно
+
+        // Добавим хосты
+        lb.addHost("10.0.0.1");
+        lb.addHost("10.0.0.2");
+        lb.addHost("10.0.0.3");
+
+        // Имитируем latency: мапа хост → диапазон latency
+        Map<String, int[]> latencyProfile = Map.of(
+            "10.0.0.1", new int[]{80, 120},
+            "10.0.0.2", new int[]{150, 250},
+            "10.0.0.3", new int[]{50, 70}
+        );
+
+        ExecutorService requestPool = Executors.newFixedThreadPool(32);
+        AtomicLong requestCount = new AtomicLong();
+        long startTime = System.currentTimeMillis();
+        long endTime = startTime + 300_000; // 5 минут
+
+        // Поток: нагрузка
+        Runnable trafficGenerator = () -> {
+            Random rand = new Random();
+            while (System.currentTimeMillis() < endTime) {
+                String host = lb.getHost();
+                if (host == null) continue;
+                int[] range = latencyProfile.getOrDefault(host, new int[]{100, 200});
+                long latency = range[0] + rand.nextInt(range[1] - range[0] + 1);
+                lb.recordResponseTime(host, latency);
+                requestCount.incrementAndGet();
+
+                try {
+                    Thread.sleep(1); // Минимальная пауза между запросами
+                } catch (InterruptedException ignored) {
+                }
+            }
+        };
+
+        // Поток: логирование RPS каждую секунду
+        Thread rpsLogger = new Thread(() -> {
+            long lastCount = 0;
+            while (System.currentTimeMillis() < endTime) {
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ignored) {
+                }
+                long current = requestCount.get();
+                long rps = current - lastCount;
+                lastCount = current;
+                System.out.println("[RPS] " + rps + " req/s");
+            }
+        });
+
+        // Поток: логирование latency каждые 10 секунд
+        Thread latencyLogger = new Thread(() -> {
+            while (System.currentTimeMillis() < endTime) {
+                try {
+                    Thread.sleep(10_000);
+                } catch (InterruptedException ignored) {
+                }
+                System.out.println("---- Средние latency за последние 10 секунд ----");
+                for (String host : lb.getAllHosts()) {
+                    double avg = lb.getHostLatencyAverage(host);
+                    System.out.printf("  %s : %.2f ms%n", host, avg);
+                }
+                System.out.println("------------------------------------------------");
+            }
+        });
+
+        // Запускаем
+        for (int i = 0; i < 16; i++) {
+            requestPool.submit(trafficGenerator);
+        }
+        rpsLogger.start();
+        latencyLogger.start();
+
+        // Ждём завершения
+        requestPool.shutdown();
+        requestPool.awaitTermination(6, TimeUnit.MINUTES); // с запасом
+        rpsLogger.join();
+        latencyLogger.join();
+
+        System.out.println("=== Тест завершён ===");
+    }
+}
+
+
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.*;
 import java.util.stream.Collectors;
 
