@@ -1,0 +1,401 @@
+
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
+
+/**
+ * Ultra high-performance load balancer with latency-based routing
+ * Optimized for maximum throughput in high-load production environment
+ * Lock-free design with pre-computed weighted selection
+ */
+public class LatencyBasedLoadBalancer {
+    
+    private final int windowSizeSeconds;
+    private final int bucketCount;
+    private final long bucketSizeMs;
+    private final double minLatencyRatio;
+    
+    // Lock-free host management
+    private final ConcurrentHashMap<String, Host> hosts = new ConcurrentHashMap<>(64, 0.75f, 16);
+    
+    // Pre-computed selection data for ultra-fast getHost()
+    private volatile WeightedHostSelector selector = new WeightedHostSelector(Collections.emptyList());
+    private final AtomicLong lastSelectorUpdate = new AtomicLong(0);
+    private final long selectorUpdateIntervalMs = 100; // Update every 100ms
+    
+    // Thread-local random for better performance
+    private final ThreadLocal<SplittableRandom> tlRandom = 
+        ThreadLocal.withInitial(SplittableRandom::new);
+    
+    /**
+     * @param windowSizeSeconds Size of sliding window in seconds
+     * @param minLatencyRatio Minimum ratio for load balancing (0.1 = 10% difference)
+     */
+    public LatencyBasedLoadBalancer(int windowSizeSeconds, double minLatencyRatio) {
+        this.windowSizeSeconds = windowSizeSeconds;
+        this.bucketCount = Math.max(32, windowSizeSeconds * 2); // More buckets for precision
+        this.bucketSizeMs = (windowSizeSeconds * 1000L) / bucketCount;
+        this.minLatencyRatio = minLatencyRatio;
+    }
+    
+    public LatencyBasedLoadBalancer() {
+        this(30, 0.1);
+    }
+    
+    public void addHost(String hostId, String address) {
+        if (hostId == null || hostId.trim().isEmpty()) {
+            throw new IllegalArgumentException("Host ID cannot be null or empty");
+        }
+        
+        Host host = new Host(hostId, address);
+        hosts.put(hostId, host);
+        invalidateSelector();
+    }
+    
+    public boolean removeHost(String hostId) {
+        boolean removed = hosts.remove(hostId) != null;
+        if (removed) {
+            invalidateSelector();
+        }
+        return removed;
+    }
+    
+    /**
+     * Ultra-fast latency recording - lock-free
+     */
+    public void recordResponseTime(String hostId, long responseTimeMs) {
+        Host host = hosts.get(hostId);
+        if (host != null) {
+            host.recordLatency(responseTimeMs);
+        }
+    }
+    
+    /**
+     * Ultra-fast host selection using pre-computed weights
+     */
+    public String getHost() {
+        WeightedHostSelector currentSelector = selector;
+        
+        // Update selector if needed (non-blocking check)
+        long now = System.currentTimeMillis();
+        if (now - lastSelectorUpdate.get() > selectorUpdateIntervalMs) {
+            updateSelectorIfNeeded(now);
+            currentSelector = selector; // Get updated selector
+        }
+        
+        return currentSelector.selectHost(tlRandom.get());
+    }
+    
+    public double getHostLatencyAverage(String hostId) {
+        Host host = hosts.get(hostId);
+        return host != null ? host.getAverageLatency() : -1;
+    }
+    
+    public Map<String, Double> getAllHostsLatency() {
+        Map<String, Double> result = new HashMap<>(hosts.size());
+        for (Host host : hosts.values()) {
+            result.put(host.getId(), host.getAverageLatency());
+        }
+        return result;
+    }
+    
+    public int getHostCount() {
+        return hosts.size();
+    }
+    
+    public boolean hasHost(String hostId) {
+        return hosts.containsKey(hostId);
+    }
+    
+    public HostInfo getHostInfo(String hostId) {
+        Host host = hosts.get(hostId);
+        if (host == null) {
+            return null;
+        }
+        return new HostInfo(host.getId(), host.getAddress(), 
+                           host.getAverageLatency(), host.getRequestCount());
+    }
+    
+    public void clearLatencyData() {
+        for (Host host : hosts.values()) {
+            host.clearLatency();
+        }
+        invalidateSelector();
+    }
+    
+    private void invalidateSelector() {
+        lastSelectorUpdate.set(0); // Force update on next getHost()
+    }
+    
+    private void updateSelectorIfNeeded(long now) {
+        // Use compareAndSet to avoid multiple threads updating simultaneously
+        if (lastSelectorUpdate.compareAndSet(lastSelectorUpdate.get(), now)) {
+            try {
+                List<Host> hostList = new ArrayList<>(hosts.values());
+                selector = new WeightedHostSelector(hostList);
+            } catch (Exception e) {
+                // In case of any error, keep the old selector
+            }
+        }
+    }
+    
+    /**
+     * Pre-computed weighted selection for ultra-fast host selection
+     */
+    private static class WeightedHostSelector {
+        private final String[] hostIds;
+        private final double[] cumulativeWeights;
+        private final double totalWeight;
+        
+        WeightedHostSelector(List<Host> hosts) {
+            if (hosts.isEmpty()) {
+                this.hostIds = new String[0];
+                this.cumulativeWeights = new double[0];
+                this.totalWeight = 0;
+                return;
+            }
+            
+            if (hosts.size() == 1) {
+                this.hostIds = new String[]{hosts.get(0).getId()};
+                this.cumulativeWeights = new double[]{1.0};
+                this.totalWeight = 1.0;
+                return;
+            }
+            
+            // Calculate weights based on latency
+            double minLatency = Double.MAX_VALUE;
+            Map<Host, Double> hostLatencies = new HashMap<>(hosts.size());
+            
+            for (Host host : hosts) {
+                double avgLatency = host.getAverageLatency();
+                if (avgLatency > 0) {
+                    hostLatencies.put(host, avgLatency);
+                    minLatency = Math.min(minLatency, avgLatency);
+                }
+            }
+            
+            // If no latency data, use equal weights
+            if (hostLatencies.isEmpty()) {
+                this.hostIds = hosts.stream().map(Host::getId).toArray(String[]::new);
+                this.cumulativeWeights = new double[hosts.size()];
+                for (int i = 0; i < hosts.size(); i++) {
+                    this.cumulativeWeights[i] = i + 1;
+                }
+                this.totalWeight = hosts.size();
+                return;
+            }
+            
+            // Calculate weights and build cumulative array
+            List<String> hostIdList = new ArrayList<>(hosts.size());
+            List<Double> weightList = new ArrayList<>(hosts.size());
+            double cumulative = 0;
+            
+            for (Host host : hosts) {
+                Double latency = hostLatencies.get(host);
+                double weight;
+                
+                if (latency != null) {
+                    double ratio = latency / minLatency;
+                    weight = ratio > 1.1 ? Math.pow(1.0 / ratio, 2) : 1.0 / ratio;
+                } else {
+                    weight = 0.1; // Small weight for hosts without data
+                }
+                
+                cumulative += weight;
+                hostIdList.add(host.getId());
+                weightList.add(cumulative);
+            }
+            
+            this.hostIds = hostIdList.toArray(new String[0]);
+            this.cumulativeWeights = weightList.stream().mapToDouble(Double::doubleValue).toArray();
+            this.totalWeight = cumulative;
+        }
+        
+        String selectHost(SplittableRandom random) {
+            if (hostIds.length == 0) return null;
+            if (hostIds.length == 1) return hostIds[0];
+            
+            double randomValue = random.nextDouble() * totalWeight;
+            
+            // Binary search for ultra-fast selection
+            int left = 0, right = cumulativeWeights.length - 1;
+            while (left < right) {
+                int mid = (left + right) >>> 1;
+                if (cumulativeWeights[mid] < randomValue) {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            }
+            
+            return hostIds[left];
+        }
+    }
+    
+    /**
+     * Ultra high-performance Host with lock-free latency tracking
+     */
+    private class Host {
+        private final String id;
+        private final String address;
+        private final LockFreeLatencyWindow latencyWindow;
+        private final LongAdder requestCount = new LongAdder();
+        
+        Host(String id, String address) {
+            this.id = id;
+            this.address = address;
+            this.latencyWindow = new LockFreeLatencyWindow();
+        }
+        
+        void recordLatency(long latencyMs) {
+            latencyWindow.addLatency(latencyMs);
+            requestCount.increment();
+        }
+        
+        double getAverageLatency() {
+            return latencyWindow.getAverageLatency();
+        }
+        
+        void clearLatency() {
+            latencyWindow.clear();
+            requestCount.reset();
+        }
+        
+        String getId() { return id; }
+        String getAddress() { return address; }
+        long getRequestCount() { return requestCount.sum(); }
+    }
+    
+    /**
+     * Lock-free sliding window implementation using atomic operations
+     */
+    private class LockFreeLatencyWindow {
+        private final AtomicReference<WindowData> currentWindow = new AtomicReference<>();
+        private final long bucketSizeMs = LatencyBasedLoadBalancer.this.bucketSizeMs;
+        
+        LockFreeLatencyWindow() {
+            currentWindow.set(new WindowData());
+        }
+        
+        void addLatency(long latencyMs) {
+            long now = System.currentTimeMillis();
+            
+            while (true) {
+                WindowData current = currentWindow.get();
+                WindowData updated = current.addLatency(latencyMs, now, bucketSizeMs, bucketCount, windowSizeSeconds);
+                
+                if (currentWindow.compareAndSet(current, updated)) {
+                    break;
+                }
+                // Retry on CAS failure - very rare in practice
+            }
+        }
+        
+        double getAverageLatency() {
+            long now = System.currentTimeMillis();
+            WindowData current = currentWindow.get();
+            return current.getAverageLatency(now, bucketSizeMs, bucketCount, windowSizeSeconds);
+        }
+        
+        void clear() {
+            currentWindow.set(new WindowData());
+        }
+    }
+    
+    /**
+     * Immutable window data for lock-free updates
+     */
+    private static class WindowData {
+        private final long[] bucketSums;
+        private final long[] bucketCounts;
+        private final long[] bucketTimestamps;
+        
+        WindowData() {
+            this.bucketSums = new long[0];
+            this.bucketCounts = new long[0];
+            this.bucketTimestamps = new long[0];
+        }
+        
+        private WindowData(long[] sums, long[] counts, long[] timestamps) {
+            this.bucketSums = sums;
+            this.bucketCounts = counts;
+            this.bucketTimestamps = timestamps;
+        }
+        
+        WindowData addLatency(long latency, long now, long bucketSizeMs, int bucketCount, int windowSizeSeconds) {
+            int bucketIndex = (int) ((now / bucketSizeMs) % bucketCount);
+            
+            // Ensure arrays are large enough
+            long[] newSums, newCounts, newTimestamps;
+            
+            if (bucketSums.length < bucketCount) {
+                newSums = Arrays.copyOf(bucketSums, bucketCount);
+                newCounts = Arrays.copyOf(bucketCounts, bucketCount);
+                newTimestamps = Arrays.copyOf(bucketTimestamps, bucketCount);
+            } else {
+                newSums = bucketSums.clone();
+                newCounts = bucketCounts.clone();
+                newTimestamps = bucketTimestamps.clone();
+            }
+            
+            // Clean old bucket if needed
+            long bucketTime = (now / bucketSizeMs) * bucketSizeMs;
+            if (newTimestamps[bucketIndex] < bucketTime - (windowSizeSeconds * 1000L)) {
+                newSums[bucketIndex] = 0;
+                newCounts[bucketIndex] = 0;
+            }
+            
+            // Add new data
+            newSums[bucketIndex] += latency;
+            newCounts[bucketIndex]++;
+            newTimestamps[bucketIndex] = bucketTime;
+            
+            return new WindowData(newSums, newCounts, newTimestamps);
+        }
+        
+        double getAverageLatency(long now, long bucketSizeMs, int bucketCount, int windowSizeSeconds) {
+            if (bucketSums.length == 0) return 0;
+            
+            long windowStart = now - (windowSizeSeconds * 1000L);
+            long totalSum = 0;
+            long totalCount = 0;
+            
+            for (int i = 0; i < Math.min(bucketSums.length, bucketCount); i++) {
+                if (bucketTimestamps.length > i && bucketTimestamps[i] >= windowStart) {
+                    totalSum += bucketSums[i];
+                    totalCount += bucketCounts[i];
+                }
+            }
+            
+            return totalCount > 0 ? (double) totalSum / totalCount : 0;
+        }
+    }
+    
+    public static class HostInfo {
+        private final String id;
+        private final String address;
+        private final double averageLatency;
+        private final long requestCount;
+        
+        public HostInfo(String id, String address, double averageLatency, long requestCount) {
+            this.id = id;
+            this.address = address;
+            this.averageLatency = averageLatency;
+            this.requestCount = requestCount;
+        }
+        
+        public String getId() { return id; }
+        public String getAddress() { return address; }
+        public double getAverageLatency() { return averageLatency; }
+        public long getRequestCount() { return requestCount; }
+        
+        @Override
+        public String toString() {
+            return String.format("Host{id='%s', address='%s', avgLatency=%.2fms, requests=%d}", 
+                               id, address, averageLatency, requestCount);
+        }
+    }
+}
