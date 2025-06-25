@@ -1,4 +1,236 @@
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * High-performance example and benchmark for LatencyBasedLoadBalancer
+ */
+public class LoadBalancerExample {
+    
+    public static void main(String[] args) throws InterruptedException {
+        // Create load balancer with 30-second sliding window
+        LatencyBasedLoadBalancer lb = new LatencyBasedLoadBalancer(30, 0.15);
+        
+        // Add hosts
+        lb.addHost("host1", "192.168.1.10:8080");
+        lb.addHost("host2", "192.168.1.11:8080");
+        lb.addHost("host3", "192.168.1.12:8080");
+        
+        System.out.println("Added " + lb.getHostCount() + " hosts");
+        
+        // Run performance benchmark
+        runPerformanceBenchmark(lb);
+        
+        // Simulate realistic load scenario
+        simulateRealisticLoad(lb);
+        
+        // Print final statistics
+        printStatistics(lb);
+    }
+    
+    private static void runPerformanceBenchmark(LatencyBasedLoadBalancer lb) throws InterruptedException {
+        System.out.println("\n=== Performance Benchmark ===");
+        
+        // Warm up
+        for (int i = 0; i < 10000; i++) {
+            lb.getHost();
+            lb.recordResponseTime("host1", 50);
+        }
+        
+        // Pure getHost() benchmark
+        int iterations = 1_000_000;
+        long startTime = System.nanoTime();
+        
+        for (int i = 0; i < iterations; i++) {
+            lb.getHost();
+        }
+        
+        long endTime = System.nanoTime();
+        double avgLatencyNs = (double)(endTime - startTime) / iterations;
+        double throughputMillion = iterations / ((endTime - startTime) / 1_000_000_000.0) / 1_000_000;
+        
+        System.out.printf("getHost() performance: %.2f ns/op, %.2fM ops/sec%n", 
+                         avgLatencyNs, throughputMillion);
+        
+        // Combined benchmark (getHost + recordResponseTime)
+        startTime = System.nanoTime();
+        
+        for (int i = 0; i < iterations; i++) {
+            String host = lb.getHost();
+            lb.recordResponseTime(host, i % 200 + 50);
+        }
+        
+        endTime = System.nanoTime();
+        avgLatencyNs = (double)(endTime - startTime) / iterations;
+        throughputMillion = iterations / ((endTime - startTime) / 1_000_000_000.0) / 1_000_000;
+        
+        System.out.printf("Combined performance: %.2f ns/op, %.2fM ops/sec%n", 
+                         avgLatencyNs, throughputMillion);
+    }
+    
+    private static void simulateRealisticLoad(LatencyBasedLoadBalancer lb) throws InterruptedException {
+        System.out.println("\n=== Realistic Load Simulation ===");
+        
+        int threadCount = Runtime.getRuntime().availableProcessors() * 2;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        
+        AtomicLong totalRequests = new AtomicLong(0);
+        AtomicLong totalErrors = new AtomicLong(0);
+        
+        long startTime = System.currentTimeMillis();
+        long duration = 5000; // 5 seconds
+        
+        // Submit tasks
+        for (int i = 0; i < threadCount; i++) {
+            executor.submit(() -> {
+                while (System.currentTimeMillis() - startTime < duration) {
+                    try {
+                        String selectedHost = lb.getHost();
+                        if (selectedHost != null) {
+                            long latency = simulateLatency(selectedHost);
+                            lb.recordResponseTime(selectedHost, latency);
+                            totalRequests.incrementAndGet();
+                        }
+                    } catch (Exception e) {
+                        totalErrors.incrementAndGet();
+                    }
+                }
+            });
+        }
+        
+        executor.shutdown();
+        executor.awaitTermination(10, TimeUnit.SECONDS);
+        
+        long actualDuration = System.currentTimeMillis() - startTime;
+        long requests = totalRequests.get();
+        long errors = totalErrors.get();
+        
+        System.out.printf("Processed %,d requests in %,d ms%n", requests, actualDuration);
+        System.out.printf("Throughput: %,.0f req/sec%n", requests * 1000.0 / actualDuration);
+        System.out.printf("Errors: %d (%.3f%%)%n", errors, errors * 100.0 / requests);
+    }
+    
+    private static long simulateLatency(String hostId) {
+        // Simulate different performance characteristics
+        switch (hostId) {
+            case "host1":
+                return 50 + (long)(Math.random() * 20); // Fast host: 50-70ms
+            case "host2":
+                return 100 + (long)(Math.random() * 30); // Medium host: 100-130ms
+            case "host3":
+                return 200 + (long)(Math.random() * 100); // Slow host: 200-300ms
+            default:
+                return 100;
+        }
+    }
+    
+    private static void printStatistics(LatencyBasedLoadBalancer lb) {
+        System.out.println("\n=== Load Balancer Statistics ===");
+        
+        for (String hostId : java.util.Arrays.asList("host1", "host2", "host3")) {
+            LatencyBasedLoadBalancer.HostInfo info = lb.getHostInfo(hostId);
+            if (info != null) {
+                System.out.println(info);
+            }
+        }
+        
+        // Test host selection distribution
+        System.out.println("\n=== Host Selection Distribution (100 requests) ===");
+        java.util.Map<String, Integer> distribution = new java.util.HashMap<>();
+        
+        for (int i = 0; i < 100; i++) {
+            String host = lb.getHost();
+            distribution.put(host, distribution.getOrDefault(host, 0) + 1);
+        }
+        
+        distribution.forEach((host, count) -> 
+            System.out.println(host + ": " + count + "% (" + count + "/100)")
+        );
+    }
+}
+
+/**
+ * Unit tests for LoadBalancer
+ */
+class LoadBalancerTest {
+    
+    public static void runTests() {
+        testBasicOperations();
+        testLatencyBasedSelection();
+        testConcurrency();
+        System.out.println("All tests passed!");
+    }
+    
+    private static void testBasicOperations() {
+        LatencyBasedLoadBalancer lb = new LatencyBasedLoadBalancer();
+        
+        // Test add/remove hosts
+        lb.addHost("test1", "localhost:8080");
+        assert lb.hasHost("test1");
+        assert lb.getHostCount() == 1;
+        
+        // Test host selection
+        String selected = lb.getHost();
+        assert "test1".equals(selected);
+        
+        // Test remove
+        assert lb.removeHost("test1");
+        assert !lb.hasHost("test1");
+        assert lb.getHostCount() == 0;
+        
+        System.out.println("✓ Basic operations test passed");
+    }
+    
+    private static void testLatencyBasedSelection() throws InterruptedException {
+        LatencyBasedLoadBalancer lb = new LatencyBasedLoadBalancer(5, 0.1);
+        
+        lb.addHost("fast", "fast:8080");
+        lb.addHost("slow", "slow:8080");
+        
+        // Record different latencies
+        for (int i = 0; i < 10; i++) {
+            lb.recordResponseTime("fast", 50);
+            lb.recordResponseTime("slow", 200);
+        }
+        
+        // Give time for window to stabilize
+        Thread.sleep(100);
+        
+        // Fast host should be selected more often
+        int fastCount = 0;
+        for (int i = 0; i < 100; i++) {
+            if ("fast".equals(lb.getHost())) {
+                fastCount++;
+            }
+        }
+        
+        assert fastCount > 60; // Should be biased towards fast host
+        System.out.println("✓ Latency-based selection test passed (fast: " + fastCount + "%)");
+    }
+    
+    private static void testConcurrency() throws InterruptedException {
+        LatencyBasedLoadBalancer lb = new LatencyBasedLoadBalancer();
+        lb.addHost("concurrent", "test:8080");
+        
+        ExecutorService executor = Executors.newFixedThreadPool(10);
+        
+        // Concurrent operations
+        for (int i = 0; i < 100; i++) {
+            final int requestId = i;
+            executor.submit(() -> {
+                String host = lb.getHost();
+                lb.recordResponseTime(host, requestId % 100 + 50);
+            });
+        }
+        
+        executor.shutdown();
+        executor.awaitTermination(5, TimeUnit.SECONDS);
+        
+        double avgLatency = lb.getHostLatencyAverage("concurrent");
+        assert avgLatency > 0;
+        
+        System.out.println("✓ Concurrency test passed (avg latency: " + avgLatency + "ms)");
+    }
+}
 
 import java.util.*;
 import java.util.concurrent.*;
