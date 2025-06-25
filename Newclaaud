@@ -1,0 +1,335 @@
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.stream.Collectors;
+
+/**
+ * High-performance load balancer with latency-based host selection
+ * Thread-safe implementation optimized for high-load production environments
+ */
+public class LatencyBasedLoadBalancer {
+    
+    private final ConcurrentHashMap<String, HostMetrics> hostPool;
+    private final ReadWriteLock hostListLock;
+    private volatile List<String> activeHosts;
+    private final int slidingWindowSeconds;
+    private final Random random;
+    private final ScheduledExecutorService cleanupExecutor;
+    
+    // Configuration parameters
+    private static final double LATENCY_WEIGHT_FACTOR = 2.0;
+    private static final long CLEANUP_INTERVAL_MS = 5000;
+    private static final int MIN_SAMPLES_FOR_BALANCING = 3;
+    
+    public LatencyBasedLoadBalancer(int slidingWindowSeconds) {
+        this.hostPool = new ConcurrentHashMap<>();
+        this.hostListLock = new ReentrantReadWriteLock();
+        this.activeHosts = new ArrayList<>();
+        this.slidingWindowSeconds = slidingWindowSeconds;
+        this.random = new ThreadLocalRandom.current();
+        this.cleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "LoadBalancer-Cleanup");
+            t.setDaemon(true);
+            return t;
+        });
+        
+        // Start cleanup task for old latency records
+        cleanupExecutor.scheduleAtFixedRate(
+            this::cleanupOldRecords, 
+            CLEANUP_INTERVAL_MS, 
+            CLEANUP_INTERVAL_MS, 
+            TimeUnit.MILLISECONDS
+        );
+    }
+    
+    /**
+     * Add host to the pool
+     */
+    public void addHost(String host) {
+        if (host == null || host.trim().isEmpty()) {
+            throw new IllegalArgumentException("Host cannot be null or empty");
+        }
+        
+        hostPool.putIfAbsent(host, new HostMetrics());
+        
+        hostListLock.writeLock().lock();
+        try {
+            if (!activeHosts.contains(host)) {
+                List<String> newHosts = new ArrayList<>(activeHosts);
+                newHosts.add(host);
+                activeHosts = newHosts;
+            }
+        } finally {
+            hostListLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Remove host from the pool
+     */
+    public void removeHost(String host) {
+        if (host == null) return;
+        
+        hostPool.remove(host);
+        
+        hostListLock.writeLock().lock();
+        try {
+            List<String> newHosts = new ArrayList<>(activeHosts);
+            newHosts.remove(host);
+            activeHosts = newHosts;
+        } finally {
+            hostListLock.writeLock().unlock();
+        }
+    }
+    
+    /**
+     * Record response time for a host
+     */
+    public void recordResponseTime(String host, long responseTimeMs) {
+        if (host == null || responseTimeMs < 0) return;
+        
+        HostMetrics metrics = hostPool.get(host);
+        if (metrics != null) {
+            metrics.addLatencySample(responseTimeMs);
+        }
+    }
+    
+    /**
+     * Get host using latency-based weighted selection
+     */
+    public String getHost() {
+        List<String> hosts = getActiveHostsSnapshot();
+        if (hosts.isEmpty()) {
+            return null;
+        }
+        
+        if (hosts.size() == 1) {
+            return hosts.get(0);
+        }
+        
+        return selectHostByLatency(hosts);
+    }
+    
+    /**
+     * Get average latency for a specific host
+     */
+    public OptionalDouble getHostLatencyAverage(String host) {
+        HostMetrics metrics = hostPool.get(host);
+        if (metrics == null) {
+            return OptionalDouble.empty();
+        }
+        return metrics.getAverageLatency();
+    }
+    
+    /**
+     * Get all hosts with their average latencies
+     */
+    public Map<String, Double> getAllHostLatencies() {
+        return hostPool.entrySet().stream()
+            .collect(Collectors.toMap(
+                Map.Entry::getKey,
+                entry -> entry.getValue().getAverageLatency().orElse(Double.NaN)
+            ));
+    }
+    
+    /**
+     * Get number of active hosts
+     */
+    public int getActiveHostCount() {
+        return activeHosts.size();
+    }
+    
+    /**
+     * Get all active hosts
+     */
+    public List<String> getActiveHosts() {
+        return new ArrayList<>(activeHosts);
+    }
+    
+    /**
+     * Get total number of samples for a host
+     */
+    public long getHostSampleCount(String host) {
+        HostMetrics metrics = hostPool.get(host);
+        return metrics != null ? metrics.getSampleCount() : 0;
+    }
+    
+    /**
+     * Clear all latency data (useful for testing or reset)
+     */
+    public void clearLatencyData() {
+        hostPool.values().forEach(HostMetrics::clearSamples);
+    }
+    
+    /**
+     * Shutdown the load balancer and cleanup resources
+     */
+    public void shutdown() {
+        cleanupExecutor.shutdown();
+        try {
+            if (!cleanupExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                cleanupExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            cleanupExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+    
+    // Private methods
+    
+    private List<String> getActiveHostsSnapshot() {
+        hostListLock.readLock().lock();
+        try {
+            return activeHosts;
+        } finally {
+            hostListLock.readLock().unlock();
+        }
+    }
+    
+    private String selectHostByLatency(List<String> hosts) {
+        Map<String, Double> hostLatencies = new HashMap<>();
+        boolean hasValidMetrics = false;
+        
+        // Collect latency data
+        for (String host : hosts) {
+            HostMetrics metrics = hostPool.get(host);
+            if (metrics != null && metrics.getSampleCount() >= MIN_SAMPLES_FOR_BALANCING) {
+                OptionalDouble avgLatency = metrics.getAverageLatency();
+                if (avgLatency.isPresent()) {
+                    hostLatencies.put(host, avgLatency.getAsDouble());
+                    hasValidMetrics = true;
+                }
+            }
+        }
+        
+        // Fall back to random selection if no valid metrics
+        if (!hasValidMetrics) {
+            return hosts.get(random.nextInt(hosts.size()));
+        }
+        
+        // Calculate weights (lower latency = higher weight)
+        double maxLatency = hostLatencies.values().stream()
+            .mapToDouble(Double::doubleValue)
+            .max().orElse(1.0);
+        
+        List<WeightedHost> weightedHosts = hostLatencies.entrySet().stream()
+            .map(entry -> {
+                double normalizedLatency = entry.getValue() / maxLatency;
+                double weight = Math.pow(1.0 / (normalizedLatency + 0.1), LATENCY_WEIGHT_FACTOR);
+                return new WeightedHost(entry.getKey(), weight);
+            })
+            .collect(Collectors.toList());
+        
+        // Add hosts without metrics with average weight
+        double avgWeight = weightedHosts.stream()
+            .mapToDouble(wh -> wh.weight)
+            .average().orElse(1.0);
+        
+        for (String host : hosts) {
+            if (!hostLatencies.containsKey(host)) {
+                weightedHosts.add(new WeightedHost(host, avgWeight));
+            }
+        }
+        
+        return selectWeightedRandom(weightedHosts);
+    }
+    
+    private String selectWeightedRandom(List<WeightedHost> weightedHosts) {
+        double totalWeight = weightedHosts.stream()
+            .mapToDouble(wh -> wh.weight)
+            .sum();
+        
+        double randomValue = random.nextDouble() * totalWeight;
+        double currentWeight = 0.0;
+        
+        for (WeightedHost weightedHost : weightedHosts) {
+            currentWeight += weightedHost.weight;
+            if (randomValue <= currentWeight) {
+                return weightedHost.host;
+            }
+        }
+        
+        // Fallback (should not happen)
+        return weightedHosts.get(0).host;
+    }
+    
+    private void cleanupOldRecords() {
+        long cutoffTime = System.currentTimeMillis() - (slidingWindowSeconds * 1000L);
+        hostPool.values().forEach(metrics -> metrics.cleanupOldSamples(cutoffTime));
+    }
+    
+    // Inner classes
+    
+    private static class WeightedHost {
+        final String host;
+        final double weight;
+        
+        WeightedHost(String host, double weight) {
+            this.host = host;
+            this.weight = weight;
+        }
+    }
+    
+    private static class HostMetrics {
+        private final ConcurrentLinkedQueue<LatencySample> samples;
+        private final AtomicLong sampleCount;
+        
+        HostMetrics() {
+            this.samples = new ConcurrentLinkedQueue<>();
+            this.sampleCount = new AtomicLong(0);
+        }
+        
+        void addLatencySample(long latencyMs) {
+            samples.offer(new LatencySample(latencyMs, System.currentTimeMillis()));
+            sampleCount.incrementAndGet();
+        }
+        
+        OptionalDouble getAverageLatency() {
+            if (samples.isEmpty()) {
+                return OptionalDouble.empty();
+            }
+            
+            double sum = 0;
+            int count = 0;
+            
+            for (LatencySample sample : samples) {
+                sum += sample.latencyMs;
+                count++;
+            }
+            
+            return count > 0 ? OptionalDouble.of(sum / count) : OptionalDouble.empty();
+        }
+        
+        long getSampleCount() {
+            return sampleCount.get();
+        }
+        
+        void cleanupOldSamples(long cutoffTime) {
+            LatencySample sample;
+            while ((sample = samples.peek()) != null && sample.timestamp < cutoffTime) {
+                if (samples.remove(sample)) {
+                    sampleCount.decrementAndGet();
+                }
+            }
+        }
+        
+        void clearSamples() {
+            samples.clear();
+            sampleCount.set(0);
+        }
+    }
+    
+    private static class LatencySample {
+        final long latencyMs;
+        final long timestamp;
+        
+        LatencySample(long latencyMs, long timestamp) {
+            this.latencyMs = latencyMs;
+            this.timestamp = timestamp;
+        }
+    }
+}
