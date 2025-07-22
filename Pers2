@@ -1,0 +1,232 @@
+package com.example.cache;
+
+import org.apache.ignite.Ignite;
+import org.apache.ignite.IgniteCache;
+import org.apache.ignite.Ignition;
+import org.apache.ignite.cache.CacheMetrics;
+import org.apache.ignite.cache.eviction.lru.LruEvictionPolicyFactory;
+import org.apache.ignite.configuration.CacheConfiguration;
+import org.apache.ignite.configuration.DataPageEvictionMode;
+import org.apache.ignite.configuration.DataRegionConfiguration;
+import org.apache.ignite.configuration.DataStorageConfiguration;
+import org.apache.ignite.configuration.IgniteConfiguration;
+import org.apache.ignite.configuration.WALMode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.PostConstruct;
+import javax.cache.expiry.CreatedExpiryPolicy;
+import javax.cache.expiry.Duration;
+import javax.cache.expiry.ExpiryPolicy;
+import java.util.concurrent.TimeUnit;
+
+@Configuration
+@Component
+@EnableScheduling
+public class IgniteCacheConfiguration {
+
+    private static final Logger log = LoggerFactory.getLogger(IgniteCacheConfiguration.class);
+    
+    private static final String CACHE_NAME = "myCache";
+    private static final long ONE_DAY_MILLIS = TimeUnit.DAYS.toMillis(1);
+    
+    private Ignite ignite;
+    private IgniteCache<String, Object> cache;
+
+    @Bean
+    public Ignite ignite() {
+        if (this.ignite != null) {
+            return this.ignite;
+        }
+
+        IgniteConfiguration cfg = new IgniteConfiguration();
+        cfg.setIgniteInstanceName("cache-instance");
+        
+        // Настройка Data Storage с персистентностью
+        DataStorageConfiguration storageCfg = new DataStorageConfiguration();
+        
+        // Регион данных с LRU eviction и персистентностью
+        DataRegionConfiguration regionCfg = new DataRegionConfiguration()
+            .setName("default")
+            .setInitialSize(100L * 1024 * 1024)     // 100MB начальный размер
+            .setMaxSize(500L * 1024 * 1024)         // 500MB максимальный размер в памяти
+            .setPersistenceEnabled(true)             // Включаем персистентность на диск
+            .setPageEvictionMode(DataPageEvictionMode.RANDOM_LRU) // LRU eviction для наименее используемых данных
+            .setEvictionThreshold(0.9);              // Начинать eviction при 90% заполнении памяти
+            
+        storageCfg.setDefaultDataRegionConfiguration(regionCfg);
+        
+        // Оптимизация для работы с диском
+        storageCfg.setWalMode(WALMode.LOG_ONLY);              // Быстрее записи на диск
+        storageCfg.setCheckpointFrequency(30_000);            // Чекпоинты каждые 30 сек
+        storageCfg.setWalSegmentSize(64 * 1024 * 1024);       // 64MB WAL сегменты
+        
+        cfg.setDataStorageConfiguration(storageCfg);
+        
+        this.ignite = Ignition.start(cfg);
+        return this.ignite;
+    }
+
+    @PostConstruct
+    public void initCache() {
+        if (this.ignite == null) {
+            this.ignite = ignite();
+        }
+
+        CacheConfiguration<String, Object> cacheCfg = new CacheConfiguration<>();
+        cacheCfg.setName(CACHE_NAME);
+        
+        // TTL - данные живут 1 день
+        cacheCfg.setExpiryPolicyFactory(() -> new CustomExpiryPolicy());
+        
+        // Настройка eviction policy для вытеснения из памяти на диск
+        cacheCfg.setOnheapCacheEnabled(true);
+        cacheCfg.setEvictionPolicyFactory(new LruEvictionPolicyFactory<>(10000)); // Максимум 10k записей в памяти
+        
+        // Включаем статистику для мониторинга
+        cacheCfg.setStatisticsEnabled(true);
+        
+        // Настройки для производительности
+        cacheCfg.setBackups(0); // Без бэкапов для простоты
+        
+        this.cache = this.ignite.getOrCreateCache(cacheCfg);
+        
+        log.info("Ignite cache '{}' initialized successfully", CACHE_NAME);
+    }
+
+    // Кастомная политика времени жизни - 1 день
+    public static class CustomExpiryPolicy implements ExpiryPolicy {
+        private final Duration expireDuration = new Duration(TimeUnit.DAYS, 1);
+        
+        @Override
+        public Duration getExpiryForCreation() {
+            return expireDuration;
+        }
+        
+        @Override
+        public Duration getExpiryForAccess() {
+            // Не продлеваем время жизни при доступе
+            return null;
+        }
+        
+        @Override
+        public Duration getExpiryForUpdate() {
+            // При обновлении - снова 1 день
+            return expireDuration;
+        }
+    }
+
+    // Методы для работы с кешем
+    public void put(String key, Object value) {
+        if (cache == null) {
+            initCache();
+        }
+        cache.put(key, value);
+        log.debug("Put key '{}' to cache", key);
+    }
+
+    public Object get(String key) {
+        if (cache == null) {
+            initCache();
+        }
+        Object value = cache.get(key);
+        log.debug("Get key '{}' from cache, found: {}", key, value != null);
+        return value;
+    }
+
+    public boolean remove(String key) {
+        if (cache == null) {
+            initCache();
+        }
+        boolean removed = cache.remove(key);
+        log.debug("Remove key '{}' from cache, success: {}", key, removed);
+        return removed;
+    }
+
+    public void clear() {
+        if (cache == null) {
+            initCache();
+        }
+        cache.clear();
+        log.info("Cache cleared");
+    }
+
+    public int size() {
+        if (cache == null) {
+            initCache();
+        }
+        return cache.size();
+    }
+
+    // Мониторинг кеша каждую минуту
+    @Scheduled(fixedRate = 60000)
+    public void logCacheStats() {
+        if (cache == null) {
+            return;
+        }
+
+        try {
+            CacheMetrics metrics = cache.metrics();
+            int cacheSize = cache.size();
+            
+            log.info("=== Cache Statistics ===");
+            log.info("Cache size: {}", cacheSize);
+            log.info("Cache hits: {}", metrics.getCacheHits());
+            log.info("Cache misses: {}", metrics.getCacheMisses());
+            log.info("Hit rate: {:.2f}%", metrics.getCacheHitPercentage());
+            log.info("Average get time: {:.2f} ms", metrics.getAverageGetTime());
+            log.info("Average put time: {:.2f} ms", metrics.getAveragePutTime());
+            log.info("Evictions: {}", metrics.getCacheEvictions());
+            log.info("========================");
+            
+        } catch (Exception e) {
+            log.error("Error getting cache statistics", e);
+        }
+    }
+
+    // Принудительная очистка expired записей каждые 5 минут
+    @Scheduled(fixedRate = 300000)
+    public void cleanupExpiredEntries() {
+        if (cache == null) {
+            return;
+        }
+
+        try {
+            // Ignite автоматически удаляет expired entries, но можно форсировать
+            log.debug("Running expired entries cleanup...");
+            // В новых версиях Ignite expired entries удаляются автоматически
+            
+        } catch (Exception e) {
+            log.error("Error during expired entries cleanup", e);
+        }
+    }
+
+    // Получение экземпляра кеша для прямого использования
+    public IgniteCache<String, Object> getCache() {
+        if (cache == null) {
+            initCache();
+        }
+        return cache;
+    }
+
+    // Получение экземпляра Ignite для прямого использования
+    public Ignite getIgnite() {
+        if (ignite == null) {
+            ignite = ignite();
+        }
+        return ignite;
+    }
+
+    // Graceful shutdown
+    public void shutdown() {
+        if (ignite != null) {
+            log.info("Shutting down Ignite instance...");
+            ignite.close();
+        }
+    }
+}
