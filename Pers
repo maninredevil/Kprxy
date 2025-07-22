@@ -1,0 +1,47 @@
+import org.apache.ignite.Ignition;
+import org.apache.ignite.configuration.*;
+import org.apache.ignite.cache.eviction.lru.LRUCacheEvictionPolicy;
+import javax.cache.expiry.Duration;
+import javax.cache.expiry.CreatedExpiryPolicy;
+import java.util.concurrent.TimeUnit;
+
+public class IgniteSetup {
+    public static void main(String[] args) {
+        // Конфигурация persistence
+        DataStorageConfiguration storageCfg = new DataStorageConfiguration();
+
+        DataRegionConfiguration regionCfg = new DataRegionConfiguration();
+        regionCfg.setName("persistentRegion");
+        regionCfg.setPersistenceEnabled(true);
+        regionCfg.setMaxSize(512L * 1024 * 1024); // 512 MB
+        regionCfg.setSwapPath("/path/to/swap"); // опционально
+
+        storageCfg.setDefaultDataRegionConfiguration(regionCfg);
+
+        IgniteConfiguration cfg = new IgniteConfiguration();
+        cfg.setDataStorageConfiguration(storageCfg);
+
+        // Конфигурация кэша
+        CacheConfiguration<String, MyObject> cacheCfg = new CacheConfiguration<>("myCache");
+        cacheCfg.setDataRegionName("persistentRegion");
+
+        // TTL = 1 день
+        cacheCfg.setExpiryPolicyFactory(
+            CreatedExpiryPolicy.factoryOf(new Duration(TimeUnit.DAYS, 1))
+        );
+
+        // Включаем on-heap кэш
+        cacheCfg.setOnheapCacheEnabled(true);
+
+        // LRU eviction
+        LRUCacheEvictionPolicy<String, MyObject> evictionPolicy = new LRUCacheEvictionPolicy<>();
+        evictionPolicy.setMaxSize(100_000); // максимум 100k объектов в памяти
+        cacheCfg.setEvictionPolicy(evictionPolicy);
+
+        cfg.setCacheConfiguration(cacheCfg);
+
+        // Старт Ignite
+        var ignite = Ignition.start(cfg);
+        ignite.cluster().active(true);
+    }
+}
