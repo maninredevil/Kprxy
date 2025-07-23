@@ -1,0 +1,12 @@
+codeToLogin.invoke(code, new EntryProcessor<String, String, Object>() {
+    public Object process(MutableEntry<String, String> entry, Object... args) {
+        String login = (String) args[0];
+        String oldCode = loginToCode.get(login);
+        if (oldCode != null && !oldCode.equals(entry.getKey())) {
+            codeToLogin.remove(oldCode);
+        }
+        loginToCode.put(login, entry.getKey());
+        entry.setValue(login);
+        return null;
+    }
+});
