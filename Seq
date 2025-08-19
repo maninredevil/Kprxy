@@ -1,0 +1,43 @@
+@Service
+public class BusinessService {
+
+    private final SequentialExecutorService executor;
+
+    public BusinessService(SequentialExecutorService executor) {
+        this.executor = executor;
+    }
+
+    public Future<String> process(String input) {
+        return executor.submit(() -> {
+            // бизнес-логика
+            Thread.sleep(2000); // имитация долгой работы
+            return "Processed: " + input;
+        });
+    }
+}
+
+import org.springframework.stereotype.Service;
+
+import java.util.concurrent.*;
+
+@Service
+public class SequentialExecutorService {
+
+    private final ExecutorService executor;
+
+    public SequentialExecutorService() {
+        int queueSize = 10; // регулируемый размер очереди
+        this.executor = new ThreadPoolExecutor(
+                1, // corePoolSize
+                1, // maximumPoolSize (только один поток)
+                0L,
+                TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(queueSize), // ограниченная очередь
+                new ThreadPoolExecutor.AbortPolicy() // что делать если очередь переполнена
+        );
+    }
+
+    public <T> Future<T> submit(Callable<T> task) {
+        return executor.submit(task);
+    }
+}
