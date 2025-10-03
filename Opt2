@@ -1,3 +1,81 @@
+package com.example;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.TypedQuery;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.time.LocalDateTime;
+
+public class PriceLoader {
+
+    private final EntityManager em;
+
+    public PriceLoader(EntityManager em) {
+        this.em = em;
+    }
+
+    public void loadFromExcel(String filePath) {
+        try (FileInputStream fis = new FileInputStream(filePath);
+             Workbook workbook = new XSSFWorkbook(fis)) {
+
+            Sheet sheet = workbook.getSheetAt(0); // первый лист
+            em.getTransaction().begin();
+
+            for (Row row : sheet) {
+                if (row.getRowNum() == 0) continue; // пропустить заголовок
+
+                String article = row.getCell(0).getStringCellValue().trim();
+                String name = row.getCell(1).getStringCellValue().trim();
+                double price = row.getCell(2).getNumericCellValue();
+                boolean available = row.getCell(3).getBooleanCellValue();
+
+                // Найти или создать продукт
+                TypedQuery<Product> q = em.createQuery(
+                        "from Product where article = :article", Product.class);
+                q.setParameter("article", article);
+                Product product = q.getResultStream().findFirst().orElseGet(() -> {
+                    Product p = new Product();
+                    p.setArticle(article);
+                    p.setName(name);
+                    em.persist(p);
+                    return p;
+                });
+
+                // Сохранить цену
+                PriceHistory history = new PriceHistory();
+                history.setProduct(product);
+                history.setPrice(price);
+                history.setAvailable(available);
+                history.setEffectiveDate(LocalDateTime.now());
+                em.persist(history);
+            }
+
+            em.getTransaction().commit();
+
+        } catch (IOException e) {
+            throw new RuntimeException("Ошибка чтения Excel файла", e);
+        }
+    }
+
+    public void printHistory(String article) {
+        TypedQuery<PriceHistory> q = em.createQuery(
+                "select h from PriceHistory h where h.product.article = :article order by h.effectiveDate",
+                PriceHistory.class);
+        q.setParameter("article", article);
+        q.getResultList().forEach(h ->
+                System.out.printf("%s | %s | %.2f | %s%n",
+                        h.getProduct().getArticle(),
+                        h.getEffectiveDate(),
+                        h.getPrice(),
+                        h.getAvailable() ? "В наличии" : "Нет в наличии")
+        );
+    }
+}
+
+
 CREATE TABLE product (
     id SERIAL PRIMARY KEY,
     article VARCHAR(50) UNIQUE NOT NULL,
