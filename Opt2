@@ -1,0 +1,221 @@
+CREATE TABLE product (
+    id SERIAL PRIMARY KEY,
+    article VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(255) NOT NULL
+);
+
+CREATE TABLE price_history (
+    id SERIAL PRIMARY KEY,
+    product_id INT NOT NULL REFERENCES product(id),
+    price NUMERIC(12,2) NOT NULL,
+    effective_date TIMESTAMP NOT NULL DEFAULT now()
+);
+
+@Entity
+@Table(name = "price_history")
+public class PriceHistory {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(optional = false)
+    @JoinColumn(name = "product_id")
+    private Product product;
+
+    private Double price;
+
+    @Column(name = "effective_date")
+    private LocalDateTime effectiveDate;
+
+    // новое поле: доступен ли товар на момент прайса
+    private Boolean available;
+
+    // геттеры/сеттеры
+    public Long getId() { return id; }
+    public Product getProduct() { return product; }
+    public Double getPrice() { return price; }
+    public LocalDateTime getEffectiveDate() { return effectiveDate; }
+    public Boolean getAvailable() { return available; }
+
+    public void setId(Long id) { this.id = id; }
+    public void setProduct(Product product) { this.product = product; }
+    public void setPrice(Double price) { this.price = price; }
+    public void setEffectiveDate(LocalDateTime effectiveDate) { this.effectiveDate = effectiveDate; }
+    public void setAvailable(Boolean available) { this.available = available; }
+}
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>price-history-demo</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <dependencies>
+        <!-- Hibernate Core -->
+        <dependency>
+            <groupId>org.hibernate.orm</groupId>
+            <artifactId>hibernate-core</artifactId>
+            <version>6.5.2.Final</version>
+        </dependency>
+
+        <!-- JPA API -->
+        <dependency>
+            <groupId>jakarta.persistence</groupId>
+            <artifactId>jakarta.persistence-api</artifactId>
+            <version>3.1.0</version>
+        </dependency>
+
+        <!-- PostgreSQL JDBC -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.7.3</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.10.1</version>
+                <configuration>
+                    <source>17</source>
+                    <target>17</target>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+<persistence xmlns="https://jakarta.ee/xml/ns/persistence" version="3.0">
+    <persistence-unit name="pricePU">
+        <provider>org.hibernate.jpa.HibernatePersistenceProvider</provider>
+        <class>com.example.Product</class>
+        <class>com.example.PriceHistory</class>
+        <properties>
+            <property name="jakarta.persistence.jdbc.driver" value="org.postgresql.Driver"/>
+            <property name="jakarta.persistence.jdbc.url" value="jdbc:postgresql://localhost:5432/mydb"/>
+            <property name="jakarta.persistence.jdbc.user" value="myuser"/>
+            <property name="jakarta.persistence.jdbc.password" value="mypassword"/>
+
+            <property name="hibernate.hbm2ddl.auto" value="update"/>
+            <property name="hibernate.dialect" value="org.hibernate.dialect.PostgreSQLDialect"/>
+            <property name="hibernate.show_sql" value="true"/>
+        </properties>
+    </persistence-unit>
+</persistence>
+
+package com.example;
+
+import jakarta.persistence.*;
+
+@Entity
+@Table(name = "product")
+public class Product {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(unique = true, nullable = false)
+    private String article;
+
+    private String name;
+
+    // геттеры и сеттеры
+    public Long getId() { return id; }
+    public String getArticle() { return article; }
+    public String getName() { return name; }
+
+    public void setId(Long id) { this.id = id; }
+    public void setArticle(String article) { this.article = article; }
+    public void setName(String name) { this.name = name; }
+}
+
+package com.example;
+
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.TypedQuery;
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+import java.time.LocalDateTime;
+
+public class PriceLoader {
+    private final EntityManager em;
+
+    public PriceLoader(EntityManager em) {
+        this.em = em;
+    }
+
+    public void loadFromFile(String filename) {
+        try (BufferedReader br = new BufferedReader(new FileReader(filename))) {
+            String line;
+            em.getTransaction().begin();
+            while ((line = br.readLine()) != null) {
+                String[] parts = line.split(",");
+                if (parts.length != 3) continue;
+                String article = parts[0].trim();
+                String name = parts[1].trim();
+                Double price = Double.parseDouble(parts[2].trim());
+
+                // Найти или создать продукт
+                TypedQuery<Product> q = em.createQuery(
+                        "from Product where article = :article", Product.class);
+                q.setParameter("article", article);
+                Product product = q.getResultStream().findFirst().orElseGet(() -> {
+                    Product p = new Product();
+                    p.setArticle(article);
+                    p.setName(name);
+                    em.persist(p);
+                    return p;
+                });
+
+                // Сохранить новую цену
+                PriceHistory history = new PriceHistory();
+                history.setProduct(product);
+                history.setPrice(price);
+                history.setEffectiveDate(LocalDateTime.now());
+                em.persist(history);
+            }
+            em.getTransaction().commit();
+        } catch (IOException e) {
+            throw new RuntimeException("Ошибка чтения файла", e);
+        }
+    }
+
+    public void printHistory(String article)
+
+
+String article = parts[0].trim();
+String name = parts[1].trim();
+Double price = Double.parseDouble(parts[2].trim());
+Boolean available = Boolean.parseBoolean(parts[3].trim());
+...
+history.setAvailable(available);
+
+
+public Boolean isAvailableNow(String article) {
+    TypedQuery<PriceHistory> q = em.createQuery(
+        "select h from PriceHistory h " +
+        "where h.product.article = :article " +
+        "order by h.effectiveDate desc", PriceHistory.class);
+    q.setParameter("article", article);
+    PriceHistory latest = q.setMaxResults(1).getResultStream().findFirst().orElse(null);
+    return latest != null && latest.getAvailable();
+}
+
+
+PriceLoader loader = new PriceLoader(em);
+loader.loadFromFile("prices_2025-10-03.csv");
+
+loader.printHistory("12345");
+
+Boolean available = loader.isAvailableNow("12345");
+System.out.println("Товар 12345 сейчас в наличии? " + available);
+
+
+
