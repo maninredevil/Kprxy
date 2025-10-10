@@ -1,0 +1,34 @@
+import java.util.concurrent.atomic.AtomicReference;
+
+private static final AtomicReference<CloseableHttpClient> clientRef = new AtomicReference<>();
+private static volatile long lastCreated = 0;
+private static final long RECREATE_INTERVAL_MS = TimeUnit.HOURS.toMillis(1);
+
+public static CloseableHttpClient getHttpClient() {
+    long now = System.currentTimeMillis();
+    CloseableHttpClient client = clientRef.get();
+
+    // проверка без блокировки (быстрая)
+    if (client == null || (now - lastCreated) > RECREATE_INTERVAL_MS) {
+        synchronized (clientRef) {
+            client = clientRef.get();
+            if (client == null || (now - lastCreated) > RECREATE_INTERVAL_MS) {
+                CloseableHttpClient oldClient = client;
+                CloseableHttpClient newClient = createHttpClientV2();
+                clientRef.set(newClient);
+                lastCreated = now;
+
+                if (oldClient != null) {
+                    // закрываем старый клиент, когда никто его уже не должен использовать
+                    try {
+                        oldClient.close();
+                    } catch (IOException ignored) {}
+                }
+
+                client = newClient;
+            }
+        }
+    }
+
+    return client;
+}
