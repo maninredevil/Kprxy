@@ -1,0 +1,61 @@
+import org.apache.hc.client5.http.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.classic.methods.HttpGet;
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
+import org.apache.hc.core5.ssl.SSLContexts;
+import org.apache.hc.core5.util.Timeout;
+
+import javax.net.ssl.SSLContext;
+import java.io.FileInputStream;
+import java.security.KeyStore;
+
+public class ApacheClientWithTimeouts {
+
+    // --- Конфигурация ---
+    private static final String KEYSTORE_PATH = "client.jks";
+    private static final String KEYSTORE_PASSWORD = "changeit";
+    private static final String KEYSTORE_TYPE = "JKS";
+
+    private static final String TARGET_URL = "https://example.com/api/data";
+
+    // Таймауты (в миллисекундах)
+    private static final int CONNECT_TIMEOUT_MS = 5000;
+    private static final int RESPONSE_TIMEOUT_MS = 8000;
+    private static final int CONNECTION_REQUEST_TIMEOUT_MS = 3000;
+    // ---------------------------------------------------------------
+
+    public static void main(String[] args) throws Exception {
+
+        // Keystore
+        KeyStore ks = KeyStore.getInstance(KEYSTORE_TYPE);
+        try (FileInputStream fis = new FileInputStream(KEYSTORE_PATH)) {
+            ks.load(fis, KEYSTORE_PASSWORD.toCharArray());
+        }
+
+        // SSL
+        SSLContext sslContext = SSLContexts.custom()
+                .loadKeyMaterial(ks, KEYSTORE_PASSWORD.toCharArray())
+                .build();
+
+        // RequestConfig
+        RequestConfig requestConfig = RequestConfig.custom()
+                .setConnectTimeout(Timeout.ofMilliseconds(CONNECT_TIMEOUT_MS))
+                .setResponseTimeout(Timeout.ofMilliseconds(RESPONSE_TIMEOUT_MS))
+                .setConnectionRequestTimeout(Timeout.ofMilliseconds(CONNECTION_REQUEST_TIMEOUT_MS))
+                .build();
+
+        // HttpClient
+        try (CloseableHttpClient client = HttpClientBuilder.create()
+                .setSSLContext(sslContext)
+                .setDefaultRequestConfig(requestConfig)
+                .build()) {
+
+            HttpGet request = new HttpGet(TARGET_URL);
+
+            var response = client.execute(request);
+
+            System.out.println("HTTP code: " + response.getCode());
+            System.out.println("Entity: " + response.getEntity());
+        }
+    }
+}
