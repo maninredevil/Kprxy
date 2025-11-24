@@ -1,6 +1,83 @@
 import org.apache.hc.client5.http.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.classic.methods.HttpGet;
 import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.ssl.ClientTlsStrategyBuilder;
+import org.apache.hc.core5.ssl.SSLContextBuilder;
+import org.apache.hc.core5.util.Timeout;
+
+import javax.net.ssl.SSLContext;
+import java.io.FileInputStream;
+import java.security.KeyStore;
+
+public class ApacheClient551 {
+
+    // --- Конфигурация ---
+    private static final String KEYSTORE_PATH = "client.jks";
+    private static final String KEYSTORE_PASSWORD = "changeit";
+    private static final String KEYSTORE_TYPE = "JKS";
+
+    private static final String TARGET_URL = "https://example.com/api/data";
+
+    private static final int CONNECT_TIMEOUT_MS = 5000;
+    private static final int RESPONSE_TIMEOUT_MS = 8000;
+    private static final int CONNECTION_REQUEST_TIMEOUT_MS = 3000;
+    // ---------------------------------------------------------
+
+    public static void main(String[] args) throws Exception {
+
+        // Загрузка JKS
+        KeyStore ks = KeyStore.getInstance(KEYSTORE_TYPE);
+        try (FileInputStream fis = new FileInputStream(KEYSTORE_PATH)) {
+            ks.load(fis, KEYSTORE_PASSWORD.toCharArray());
+        }
+
+        // Создание SSLContext
+        SSLContext sslContext = SSLContextBuilder.create()
+                .loadKeyMaterial(ks, KEYSTORE_PASSWORD.toCharArray())
+                .build();
+
+        // TLS стратегия — это и есть замена setSSLContext / setDefaultSslContext
+        var tlsStrategy = ClientTlsStrategyBuilder.create()
+                .setSslContext(sslContext)
+                .build();
+
+        // Connection Manager с кастомным SSL
+        PoolingHttpClientConnectionManager cm =
+                PoolingHttpClientConnectionManagerBuilder.create()
+                        .setTlsStrategy(tlsStrategy)
+                        .build();
+
+        // Таймауты
+        RequestConfig requestConfig = RequestConfig.custom()
+                .setConnectTimeout(Timeout.ofMilliseconds(CONNECT_TIMEOUT_MS))
+                .setResponseTimeout(Timeout.ofMilliseconds(RESPONSE_TIMEOUT_MS))
+                .setConnectionRequestTimeout(Timeout.ofMilliseconds(CONNECTION_REQUEST_TIMEOUT_MS))
+                .build();
+
+        // HttpClient
+        try (CloseableHttpClient client = HttpClients.custom()
+                .setConnectionManager(cm)
+                .setDefaultRequestConfig(requestConfig)
+                .build()) {
+
+            HttpGet request = new HttpGet(TARGET_URL);
+
+            var response = client.execute(request);
+
+            System.out.println("HTTP code: " + response.getCode());
+            System.out.println("Entity: " + response.getEntity());
+        }
+    }
+}
+
+
+
+import org.apache.hc.client5.http.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.classic.methods.HttpGet;
+import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
 import org.apache.hc.core5.ssl.SSLContexts;
 import org.apache.hc.core5.util.Timeout;
