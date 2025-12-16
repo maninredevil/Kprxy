@@ -1,3 +1,11 @@
+EXTENSION = query_logger
+MODULE_big = query_logger
+OBJS = query_logger.o
+
+PG_CONFIG = pg_config
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+
 CREATE EXTENSION query_logger;
 
 shared_preload_libraries = 'query_logger'
