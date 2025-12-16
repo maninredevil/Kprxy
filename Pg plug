@@ -1,0 +1,110 @@
+CREATE EXTENSION query_logger;
+
+shared_preload_libraries = 'query_logger'
+query_logger.log_path = '/var/log/postgresql/query_logger.log'
+
+-- file: query_logger--1.0.sql
+-- Расширение без SQL‑объектов, только хуки в backend
+
+# file: query_logger.control
+comment = 'Log all queries to a separate file via executor hook'
+default_version = '1.0'
+relocatable = false
+module_pathname = '$libdir/query_logger'
+
+/* file: query_logger.c */
+#include "postgres.h"
+#include "fmgr.h"
+#include "executor/executor.h"
+#include "tcop/tcopprot.h"
+#include "miscadmin.h"
+
+PG_MODULE_MAGIC;
+
+void _PG_init(void);
+void _PG_fini(void);
+
+/* Сохраняем предыдущие хуки, если были */
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ExecutorEnd_hook_type   prev_ExecutorEnd   = NULL;
+
+/* Дескриптор нашего лог‑файла */
+static FILE *ql_log_file = NULL;
+
+/* Параметр GUC для пути к файлу лога */
+static char *ql_log_path = NULL;
+
+static void
+ql_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+    /* Пишем строку запроса, если она есть */
+    if (debug_query_string != NULL && ql_log_file != NULL)
+    {
+        fprintf(ql_log_file, "PID %d: %s
+",
+                MyProcPid, debug_query_string);
+        fflush(ql_log_file);
+    }
+
+    /* Передаём управление дальше по цепочке хуков/стандартному исполнителю */
+    if (prev_ExecutorStart)
+        prev_ExecutorStart(queryDesc, eflags);
+    else
+        standard_ExecutorStart(queryDesc, eflags);
+}
+
+static void
+ql_ExecutorEnd(QueryDesc *queryDesc)
+{
+    if (prev_ExecutorEnd)
+        prev_ExecutorEnd(queryDesc);
+    else
+        standard_ExecutorEnd(queryDesc);
+}
+
+/* Инициализация модуля */
+void
+_PG_init(void)
+{
+    DefineCustomStringVariable(
+        "query_logger.log_path",
+        "Path to query logger file.",
+        NULL,
+        &ql_log_path,
+        "/var/log/postgresql/query_logger.log",
+        PGC_POSTMASTER,
+        0,
+        NULL, NULL, NULL);
+
+    /* Открываем файл на запись/добавление */
+    if (ql_log_path != NULL)
+    {
+        ql_log_file = fopen(ql_log_path, "a");
+        if (ql_log_file == NULL)
+            ereport(WARNING,
+                    (errmsg("query_logger: cannot open log file "%s"",
+                            ql_log_path)));
+    }
+
+    /* Подцепляемся к хукам исполнителя */
+    prev_ExecutorStart = ExecutorStart_hook;
+    ExecutorStart_hook = ql_ExecutorStart;
+
+    prev_ExecutorEnd = ExecutorEnd_hook;
+    ExecutorEnd_hook = ql_ExecutorEnd;
+}
+
+/* Деинициализация (опционально для shared_preload, но корректно закрыть файл полезно) */
+void
+_PG_fini(void)
+{
+    ExecutorStart_hook = prev_ExecutorStart;
+    ExecutorEnd_hook   = prev_ExecutorEnd;
+
+    if (ql_log_file != NULL)
+    {
+        fclose(ql_log_file);
+        ql_log_file = NULL;
+    }
+}
+
