@@ -1,0 +1,300 @@
+package com.example.ranger.sql;
+
+import io.netty.bootstrap.ServerBootstrap;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.http.HttpObjectAggregator;
+import io.netty.handler.codec.http.HttpServerCodec;
+
+public class RangerPluginServer {
+    private final int port;
+    private final PostgreSqlRangerPlugin plugin;
+    private final NioEventLoopGroup bossGroup = new NioEventLoopGroup();
+    private final NioEventLoopGroup workerGroup = new NioEventLoopGroup();
+
+    public RangerPluginServer(int port, String rangerAdminUrl, String serviceName) {
+        this.port = port;
+        this.plugin = new PostgreSqlRangerPlugin(rangerAdminUrl, serviceName);
+    }
+
+    public void run() throws Exception {
+        try {
+            ServerBootstrap b = new ServerBootstrap();
+            b.group(bossGroup, workerGroup)
+             .channel(NioServerSocketChannel.class)
+             .childHandler(new ChannelInitializer<SocketChannel>() {
+                 @Override
+                 public void initChannel(SocketChannel ch) {
+                     ch.pipeline().addLast(
+                         new HttpServerCodec(),
+                         new HttpObjectAggregator(65536),
+                         new RangerHttpHandler(plugin)
+                     );
+                 }
+             })
+             .option(ChannelOption.SO_BACKLOG, 128)
+             .childOption(ChannelOption.SO_KEEPALIVE, true);
+
+            ChannelFuture f = b.bind(port).sync();
+            System.out.println("SQL Ranger Plugin запущен на http://localhost:" + port);
+            f.channel().closeFuture().sync();
+        } finally {
+            bossGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully();
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        int port = 8080;
+        String rangerAdminUrl = System.getProperty("ranger.admin.url", "http://localhost:6080");
+        String serviceName = System.getProperty("ranger.service.name", "postgresql-service");
+        
+        new RangerPluginServer(port, rangerAdminUrl, serviceName).run();
+    }
+}
+
+package com.example.ranger.sql;
+
+import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.http.*;
+import io.netty.util.CharsetUtil;
+
+public class RangerHttpHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
+    private final PostgreSqlRangerPlugin plugin;
+
+    public RangerHttpHandler(PostgreSqlRangerPlugin plugin) {
+        this.plugin = plugin;
+    }
+
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest request) {
+        if (!request.decoderResult().isSuccess()) {
+            sendError(ctx, HttpResponseStatus.BAD_REQUEST);
+            return;
+        }
+
+        if (HttpMethod.GET.equals(request.method()) && request.uri().startsWith("/validate")) {
+            String sql = request.uri().split("sql=")[1].split("&")[0];
+            String user = request.uri().split("user=")[1];
+            
+            boolean allowed = plugin.isAccessAllowed(sql, user);
+            
+            String response = "{"allowed": " + allowed + ", "sql":"" + sql + "", "user":"" + user + ""}";
+            sendResponse(ctx, response, HttpResponseStatus.OK);
+        } else {
+            sendError(ctx, HttpResponseStatus.NOT_FOUND);
+        }
+    }
+
+    private void sendResponse(ChannelHandlerContext ctx, String content, HttpResponseStatus status) {
+        FullHttpResponse response = new DefaultFullHttpResponse(
+            HttpVersion.HTTP_1_1, status, Unpooled.copiedBuffer(content, CharsetUtil.UTF_8));
+        response.headers().set(HttpHeaderNames.CONTENT_TYPE, "application/json");
+        response.headers().set(HttpHeaderNames.CONTENT_LENGTH, response.content().readableBytes());
+        
+        ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+    }
+
+    private void sendError(ChannelHandlerContext ctx, HttpResponseStatus status) {
+        String content = "{"error": "" + status.reasonPhrase() + ""}";
+        sendResponse(ctx, content, status);
+    }
+}
+
+package com.example.ranger.sql;
+
+import org.apache.ranger.plugin.audit.RangerDefaultAuditHandler;
+import org.apache.ranger.plugin.policyengine.RangerAccessRequestImpl;
+import org.apache.ranger.plugin.policyengine.RangerAccessResult;
+import org.apache.ranger.plugin.service.RangerBasePlugin;
+
+import java.util.Collections;
+import java.util.Date;
+
+public class PostgreSqlRangerPlugin {
+    private final RangerBasePlugin plugin;
+
+    public PostgreSqlRangerPlugin(String rangerAdminUrl, String serviceName) {
+        System.setProperty("ranger.plugin.postgresql.policy.rest.url", rangerAdminUrl);
+        System.setProperty("ranger.plugin.postgresql.service.name", serviceName);
+        System.setProperty("ranger.plugin.postgresql.policy.pollIntervalMs", "30000");
+        
+        this.plugin = new RangerBasePlugin("postgresql", serviceName);
+        this.plugin.setResultProcessor(new RangerDefaultAuditHandler());
+        this.plugin.init();
+    }
+
+    public boolean isAccessAllowed(String sql, String user) {
+        try {
+            SqlAccessRequest accessRequest = parseSqlQuery(sql);
+            
+            RangerAccessRequestImpl request = new RangerAccessRequestImpl();
+            request.setResource(accessRequest.toRangerResource());
+            request.setUser(user);
+            request.setUserGroups(Collections.emptySet());
+            request.setAccessType(accessRequest.getAccessType());
+            request.setAction("sql");
+            request.setAccessTime(new Date());
+
+            RangerAccessResult result = plugin.isAccessAllowed(request);
+            return result != null && result.getIsAllowed();
+        } catch (Exception e) {
+            System.err.println("SQL parse error: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private SqlAccessRequest parseSqlQuery(String sql) {
+        sql = sql.toLowerCase().trim();
+        
+        if (sql.startsWith("select")) {
+            String table = extractTableFromSelect(sql);
+            return new SqlAccessRequest("public", table, "select");
+        } else if (sql.startsWith("insert into")) {
+            String table = extractTableFromInsert(sql);
+            return new SqlAccessRequest("public", table, "insert");
+        } else if (sql.startsWith("update")) {
+            String table = extractTableFromUpdate(sql);
+            return new SqlAccessRequest("public", table, "update");
+        } else if (sql.startsWith("delete from")) {
+            String table = extractTableFromDelete(sql);
+            return new SqlAccessRequest("public", table, "delete");
+        }
+        
+        throw new IllegalArgumentException("Unsupported SQL: " + sql);
+    }
+
+    private String extractTableFromSelect(String sql) {
+        int fromIdx = sql.indexOf("from ") + 5;
+        int spaceIdx = sql.indexOf(' ', fromIdx);
+        if (spaceIdx == -1) spaceIdx = sql.length();
+        return sql.substring(fromIdx, spaceIdx).trim();
+    }
+
+    private String extractTableFromInsert(String sql) {
+        int intoIdx = sql.indexOf("into ") + 5;
+        int spaceIdx = sql.indexOf(' ', intoIdx);
+        if (spaceIdx == -1) spaceIdx = sql.length();
+        return sql.substring(intoIdx, spaceIdx).trim();
+    }
+
+    private String extractTableFromUpdate(String sql) {
+        int spaceIdx = sql.indexOf(' ', 7);
+        if (spaceIdx == -1) spaceIdx = sql.length();
+        return sql.substring(7, spaceIdx).trim();
+    }
+
+    private String extractTableFromDelete(String sql) {
+        int fromIdx = sql.indexOf("from ") + 5;
+        int spaceIdx = sql.indexOf(' ', fromIdx);
+        if (spaceIdx == -1) spaceIdx = sql.length();
+        return sql.substring(fromIdx, spaceIdx).trim();
+    }
+}
+
+package com.example.ranger.sql;
+
+import org.apache.ranger.plugin.policyengine.RangerAccessResourceImpl;
+
+public class SqlAccessRequest {
+    private final String database;
+    private final String table;
+    private final String accessType;
+
+    public SqlAccessRequest(String database, String table, String accessType) {
+        this.database = database;
+        this.table = table;
+        this.accessType = accessType;
+    }
+
+    public RangerAccessResourceImpl toRangerResource() {
+        RangerAccessResourceImpl resource = new RangerAccessResourceImpl();
+        resource.setValue("database", database);
+        resource.setValue("table", table);
+        return resource;
+    }
+
+    public String getAccessType() {
+        return accessType;
+    }
+}
+
+package com.example.ranger.sql;
+
+import org.apache.ranger.plugin.service.RangerBaseService;
+
+public class PostgreSqlAuthService extends RangerBaseService {
+}
+
+{
+  "name": "postgresql",
+  "implClass": "com.example.ranger.sql.PostgreSqlAuthService",
+  "label": "PostgreSQL",
+  "description": "PostgreSQL Authorization",
+  "resources": [
+    {"itemId": 1, "name": "database", "type": "string", "level": 1, "parent": "", "mandatory": true},
+    {"itemId": 2, "name": "table", "type": "string", "level": 2, "parent": "database", "mandatory": true},
+    {"itemId": 3, "name": "column", "type": "string", "level": 3, "parent": "table", "mandatory": false}
+  ],
+  "accessTypes": [
+    {"name": "select", "label": "Select"},
+    {"name": "insert", "label": "Insert"},
+    {"name": "update", "label": "Update"},
+    {"name": "delete", "label": "Delete"}
+  ]
+}
+
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>sql-ranger-plugin</artifactId>
+    <version>1.0</version>
+    <properties>
+        <maven.compiler.source>8</maven.compiler.source>
+        <maven.compiler.target>8</maven.compiler.target>
+        <ranger.version>2.4.0</ranger.version>
+    </properties>
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.ranger</groupId>
+            <artifactId>ranger-plugins-common</artifactId>
+            <version>${ranger.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.ranger</groupId>
+            <artifactId>ranger-plugins-audit</artifactId>
+            <version>${ranger.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>4.1.100.Final</version>
+        </dependency>
+    </dependencies>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.4.1</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
