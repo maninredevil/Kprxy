@@ -1,3 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <property>
+        <name>ranger.plugin.postgresql.service.name</name>
+        <value>postgresql-service</value>
+    </property>
+
+    <property>
+        <name>ranger.plugin.postgresql.policy.rest.url</name>
+        <value>http://localhost:6080</value>
+    </property>
+
+    <property>
+        <name>ranger.plugin.postgresql.policy.pollIntervalMs</name>
+        <value>30000</value>
+    </property>
+
+    <property>
+        <name>ranger.plugin.postgresql.policy.pollRetryIntervalMs</name>
+        <value>5000</value>
+    </property>
+
+    <!-- ВОТ ОН -->
+    <property>
+        <name>ranger.plugin.postgresql.policy.poller.thread.pool.size</name>
+        <value>3</value>
+    </property>
+
+    <property>
+        <name>ranger.plugin.postgresql.policy.cache.dir</name>
+        <value>/tmp/ranger/postgresql</value>
+    </property>
+
+    <property>
+        <name>ranger.plugin.postgresql.policy.cache.filename</name>
+        <value>policy-cache.json</value>
+    </property>
+
+    <property>
+        <name>ranger.plugin.postgresql.audit.solr.enabled</name>
+        <value>false</value>
+    </property>
+
+    <property>
+        <name>ranger.plugin.postgresql.audit.hdfs.enabled</name>
+        <value>false</value>
+    </property>
+
+</configuration>
+
+
+
 src/main/resources/ranger-postgresql.xml
 
 <?xml version="1.0" encoding="UTF-8"?>
