@@ -1,3 +1,99 @@
+src/main/resources/ranger-postgresql.xml
+
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <!-- Service -->
+    <property>
+        <name>ranger.plugin.postgresql.service.name</name>
+        <value>postgresql-service</value>
+    </property>
+
+    <!-- Ranger Admin -->
+    <property>
+        <name>ranger.plugin.postgresql.policy.rest.url</name>
+        <value>http://localhost:6080</value>
+    </property>
+
+    <!-- Polling -->
+    <property>
+        <name>ranger.plugin.postgresql.policy.pollIntervalMs</name>
+        <value>30000</value>
+    </property>
+
+    <property>
+        <name>ranger.plugin.postgresql.policy.pollRetryIntervalMs</name>
+        <value>5000</value>
+    </property>
+
+    <!-- Thread pool (КРИТИЧНО) -->
+    <property>
+        <name>ranger.plugin.postgresql.thread.pool.size</name>
+        <value>3</value>
+    </property>
+
+    <!-- Cache -->
+    <property>
+        <name>ranger.plugin.postgresql.policy.cache.dir</name>
+        <value>/tmp/ranger/postgresql</value>
+    </property>
+
+    <property>
+        <name>ranger.plugin.postgresql.policy.cache.filename</name>
+        <value>policy-cache.json</value>
+    </property>
+
+    <!-- Audit (выключим для standalone) -->
+    <property>
+        <name>ranger.plugin.postgresql.audit.solr.enabled</name>
+        <value>false</value>
+    </property>
+
+    <property>
+        <name>ranger.plugin.postgresql.audit.hdfs.enabled</name>
+        <value>false</value>
+    </property>
+
+</configuration>
+
+public class PostgreSqlRangerPlugin {
+
+    private final RangerBasePlugin plugin;
+
+    public PostgreSqlRangerPlugin(String rangerAdminUrl, String serviceName) {
+
+        // ОБЯЗАТЕЛЬНО: все параметры ДО new RangerBasePlugin
+
+        System.setProperty("ranger.plugin.postgresql.policy.rest.url", rangerAdminUrl);
+        System.setProperty("ranger.plugin.postgresql.service.name", serviceName);
+
+        // polling
+        System.setProperty("ranger.plugin.postgresql.policy.pollIntervalMs", "30000");
+        System.setProperty("ranger.plugin.postgresql.policy.pollRetryIntervalMs", "5000");
+
+        // thread pool (КРИТИЧНО)
+        System.setProperty("ranger.plugin.postgresql.thread.pool.size", "3");
+
+        // cache (если нет — Ranger иногда падает молча)
+        System.setProperty("ranger.plugin.postgresql.policy.cache.dir", "/tmp/ranger/postgresql");
+        System.setProperty("ranger.plugin.postgresql.policy.cache.filename", "policy-cache.json");
+
+        // audit (иначе WARN/ERROR)
+        System.setProperty("ranger.plugin.postgresql.audit.solr.enabled", "false");
+        System.setProperty("ranger.plugin.postgresql.audit.hdfs.enabled", "false");
+
+        this.plugin = new RangerBasePlugin("postgresql", serviceName);
+        this.plugin.init();
+    }
+
+    public RangerBasePlugin getPlugin() {
+        return plugin;
+    }
+}
+
+
+
+
 package com.example.ranger.sql;
 
 import io.netty.bootstrap.ServerBootstrap;
