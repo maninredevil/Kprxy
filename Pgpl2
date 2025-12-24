@@ -1,6 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
+<property>
+    <name>ranger.plugin.postgresql.policy.rest.client.connection.ttl.ms</name>
+    <value>60000</value>
+</property>
 
+<property>
+    <name>ranger.plugin.postgresql.policy.download.thread.count</name>
+    <value>1</value>
+</property>
     <property>
         <name>ranger.plugin.postgresql.service.name</name>
         <value>postgresql-service</value>
