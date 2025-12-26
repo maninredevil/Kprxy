@@ -1,0 +1,135 @@
+CustomRangerPlugin plugin = new CustomRangerPlugin("custom", "custom-service");
+plugin.init();
+
+boolean canRead = plugin.isAccessAllowed("users", "read", "john");
+boolean canWrite = plugin.isAccessAllowed("users", "write", "alice");
+
+System.out.println("John can read: " + canRead); // true/false по политике Ranger
+
+java -Dranger.plugin.custom.policy.rest.url=http://ranger-admin:6080 \
+     -Dranger.plugin.custom.policy.rest.username=admin \
+     -Dranger.plugin.custom.policy.rest.password=rangerR0cks! \
+     -Dranger.plugin.custom.service.name=custom-service \
+     -jar target/ranger-custom-plugin-1.0.0.jar
+
+ranger.plugin.custom.service.name=custom-service
+ranger.plugin.custom.policy.rest.url=http://ranger-admin:6080
+ranger.plugin.custom.policy.rest.username=admin
+ranger.plugin.custom.policy.rest.password=rangerR0cks!
+ranger.plugin.custom.service.type=custom
+ranger.plugin.custom.policy.pollIntervalMs=30000
+
+<?xml version="1.0" encoding="UTF-8"?>
+<ranger-policies>
+    <policy-store>
+        <policy-source>admin</policy-source>
+        <repository-name>custom-service</repository-name>
+    </policy-store>
+</ranger-policies>
+
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+    <modelVersion>4.0.0</modelVersion>
+    
+    <groupId>com.example</groupId>
+    <artifactId>ranger-custom-plugin</artifactId>
+    <version>1.0.0</version>
+    
+    <properties>
+        <maven.compiler.source>8</maven.compiler.source>
+        <maven.compiler.target>8</maven.compiler.target>
+        <ranger.version>2.4.0</ranger.version>
+    </properties>
+    
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.ranger</groupId>
+            <artifactId>ranger-plugins-common</artifactId>
+            <version>${ranger.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.ranger</groupId>
+            <artifactId>ranger-plugins-audit</artifactId>
+            <version>${ranger.version}</version>
+        </dependency>
+    </dependencies>
+    
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.2.4</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.example.ranger.plugin.CustomRangerPlugin</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+package com.example.ranger.plugin;
+
+import org.apache.ranger.plugin.service.RangerBasePlugin;
+import org.apache.ranger.plugin.policyengine.RangerAccessRequestImpl;
+import org.apache.ranger.plugin.policyengine.RangerAccessResourceImpl;
+import org.apache.ranger.plugin.audit.RangerDefaultAuditHandler;
+import org.apache.ranger.plugin.model.RangerServiceDef;
+import java.util.HashSet;
+import java.util.Set;
+
+public class CustomRangerPlugin {
+    private RangerBasePlugin plugin;
+    
+    public CustomRangerPlugin(String serviceType, String serviceName) {
+        plugin = new RangerBasePlugin(serviceType, serviceName, "customApp");
+        plugin.setResultProcessor(new RangerDefaultAuditHandler());
+    }
+    
+    public void init() {
+        plugin.init();
+    }
+    
+    public boolean isAccessAllowed(String resource, String accessType, String user) {
+        RangerAccessResourceImpl resourceImpl = new RangerAccessResourceImpl();
+        resourceImpl.setValue("resource", resource);
+        
+        RangerAccessRequestImpl request = new RangerAccessRequestImpl();
+        request.setResource(resourceImpl);
+        request.setAccessType(accessType);
+        request.setUser(user);
+        request.setUserGroups(new HashSet<>());
+        request.setAccessTime(System.currentTimeMillis());
+        
+        return plugin.isAccessAllowed(request).getIsAllowed();
+    }
+    
+    public static void main(String[] args) {
+        System.setProperty("ranger.plugin.custom.service.name", "custom-service");
+        System.setProperty("ranger.plugin.custom.service.type", "custom");
+        
+        CustomRangerPlugin plugin = new CustomRangerPlugin("custom", "custom-service");
+        plugin.init();
+        
+        while (true) {
+            try {
+                Thread.sleep(10000);
+                System.out.println("Policies version: " + plugin.plugin.getPoliciesVersion());
+            } catch (InterruptedException e) {
+                break;
+            }
+        }
+    }
+}
