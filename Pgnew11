@@ -1,3 +1,20 @@
+java \
+ -Dranger.plugin.postgres.service.name=postgres_test \
+ -Dranger.plugin.postgres.policy.rest.url=http://RANGER_HOST:6080 \
+ -Dranger.plugin.postgres.policy.rest.client.username=admin \
+ -Dranger.plugin.postgres.policy.rest.client.password=your_password \
+ -jar target/your-plugin.jar
+
+CustomRangerPlugin plugin = new CustomRangerPlugin("postgres", "postgres_test");
+plugin.init();
+
+System.setProperty("ranger.plugin.postgres.service.name", "postgres_test");
+System.setProperty("ranger.plugin.postgres.policy.rest.url", "http://<RANGER_HOST>:6080");
+System.setProperty("ranger.plugin.postgres.policy.rest.client.username", "admin");
+System.setProperty("ranger.plugin.postgres.policy.rest.client.password", "your_password");
+
+
+
 CustomRangerPlugin plugin = new CustomRangerPlugin("custom", "custom-service");
 plugin.init();
 
